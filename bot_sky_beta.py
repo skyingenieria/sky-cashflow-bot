@@ -708,7 +708,7 @@ async def cmd_memoria(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cobrar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Proyectos con saldo pendiente de cobro desde 005 Proyectos por cobrar."""
+    """Proyectos con saldo pendiente desde 005 Proyectos por cobrar."""
     msg = await update.message.reply_text("⏳ Consultando proyectos por cobrar...")
     try:
         ws   = get_worksheet("005 Proyectos por cobrar")
@@ -716,44 +716,52 @@ async def cmd_cobrar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(data) < 2:
             await msg.edit_text("📭 No hay datos en Proyectos por cobrar.")
             return
-        headers = data[0]
-        def col(name):
-            try: return headers.index(name)
-            except: return -1
-        col_exp    = col("Expediente")
-        col_cli    = col("Cliente")
-        col_proy   = col("Proyecto")
-        col_saldo  = col("Saldo")
-        col_estado = col("Estado Actual")
 
+        # Estructura: Moneda | Aux (Expediente - Proyecto - Cliente) | Presupuesto | Cobrado | Saldo
         pendientes = []
         for row in data[1:]:
-            saldo_raw = row[col_saldo].strip() if col_saldo >= 0 and col_saldo < len(row) else ""
-            saldo_num = saldo_raw.replace("$","").replace(".","").replace(",",".").strip()
+            if len(row) < 5:
+                continue
+            moneda = row[0].strip()
+            aux    = row[1].strip()   # "F25077 - YPF Campana - Fontana"
+            saldo  = row[4].strip()   # "$1,000,000.00"
+            if not aux or not saldo:
+                continue
+            # Parsear saldo
+            saldo_num_str = saldo.replace("$","").replace(".","").replace(",",".").strip()
             try:
-                if float(saldo_num) <= 0:
+                saldo_num = float(saldo_num_str)
+                if saldo_num <= 0:
                     continue
             except:
                 continue
+            # Parsear Aux: "F25077 - YPF Campana - Fontana"
+            partes = aux.split(" - ", 2)
+            exp    = partes[0].strip() if len(partes) > 0 else ""
+            proy   = partes[1].strip() if len(partes) > 1 else ""
+            cli    = partes[2].strip() if len(partes) > 2 else ""
+            presup = row[2].strip() if len(row) > 2 else ""
+            cobrado= row[3].strip() if len(row) > 3 else ""
             pendientes.append({
-                "exp":    row[col_exp].strip()    if col_exp    >= 0 and col_exp    < len(row) else "",
-                "cli":    row[col_cli].strip()    if col_cli    >= 0 and col_cli    < len(row) else "",
-                "proy":   row[col_proy].strip()   if col_proy   >= 0 and col_proy   < len(row) else "",
-                "saldo":  saldo_raw,
-                "estado": row[col_estado].strip() if col_estado >= 0 and col_estado < len(row) else "",
+                "exp": exp, "proy": proy, "cli": cli,
+                "moneda": moneda, "presup": presup,
+                "cobrado": cobrado, "saldo": saldo
             })
 
         if not pendientes:
             await msg.edit_text("✅ No hay proyectos con saldo pendiente.")
             return
 
-        lines = [f"📋 *Proyectos por cobrar ({len(pendientes)})*\n"]
-        for p in pendientes[:25]:
-            lines.append(f"• `{p['exp']}` — {p['cli']}")
-            if p['proy']: lines.append(f"  _{p['proy'][:50]}_")
-            lines.append(f"  Saldo: `{p['saldo']}` | {p['estado']}")
-        if len(pendientes) > 25:
-            lines.append(f"\n_...y {len(pendientes)-25} más_")
+        total = len(pendientes)
+        lines = [f"📋 *Proyectos por cobrar ({total})*\n"]
+        for p in pendientes[:20]:
+            mon_emoji = "💵" if "USD" in p["moneda"].upper() else "💰"
+            lines.append(f"{mon_emoji} `{p['exp']}` — *{p['cli'] or p['proy']}*")
+            if p['proy']: lines.append(f"  _{p['proy'][:45]}_")
+            lines.append(f"  Presup: {p['presup']} | Cobrado: {p['cobrado']}")
+            lines.append(f"  *Saldo: {p['saldo']}* ({p['moneda']})")
+        if total > 20:
+            lines.append(f"\n_...y {total-20} más_")
 
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
@@ -762,76 +770,554 @@ async def cmd_cobrar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Busca transacciones por cliente, proveedor o expediente."""
+    """Búsqueda inteligente: acepta expediente, cliente o proyecto.
+    Cruza 001 Clientes + 004 Presupuestos + 003 Transacciones para completar info faltante."""
     if not ctx.args:
         await update.message.reply_text(
-            "🔍 *Buscar transacciones*\n\n"
+            "🔍 *Buscar*\n\n"
             "Uso: `/buscar [término]`\n\n"
-            "Ejemplos:\n"
-            "`/buscar SBMT` — todas las tx de SBMT\n"
-            "`/buscar F25031` — por expediente\n"
-            "`/buscar Federico` — por proveedor",
+            "Podés buscar por:\n"
+            "• Expediente: `/buscar F25031`\n"
+            "• Cliente: `/buscar SBMT`\n"
+            "• Proyecto: `/buscar Campana`\n\n"
+            "El bot busca en clientes, presupuestos y transacciones automáticamente.",
             parse_mode="Markdown"
         )
         return
-    query = " ".join(ctx.args).lower()
+
+    query = " ".join(ctx.args).lower().strip()
     msg   = await update.message.reply_text(f"🔍 Buscando `{query}`...", parse_mode="Markdown")
+
     try:
-        ws      = get_worksheet("003 Transacciones")
-        data    = ws.get_all_values()
-        if len(data) < 2:
-            await msg.edit_text("📭 Sin datos en la planilla.")
-            return
-        headers = data[0]
-        def col(name):
-            try: return headers.index(name)
-            except: return -1
-        col_fecha = col("Fecha")
-        col_tipo  = col("Transacción")
-        col_cli   = col("Cliente")
-        col_prv   = col("Proveedor")
-        col_exp   = col("Expediente")
-        col_proy  = col("Proyecto")
-        col_imp   = col("Importe USD")
+        resultado = {}
 
-        resultados = []
-        for row in data[1:]:
-            if any(query in cell.lower() for cell in row):
-                resultados.append(row)
+        # ── 1. Buscar en 001 Clientes ──────────────────────────────
+        try:
+            ws_cli  = get_worksheet("001 Clientes")
+            cli_data = ws_cli.get_all_values()
+            for row in cli_data[1:]:
+                if any(query in cell.lower() for cell in row if cell):
+                    resultado["cliente_id"]     = row[0].strip() if len(row) > 0 else ""
+                    resultado["cliente_nombre"]  = row[1].strip() if len(row) > 1 else ""
+                    resultado["cliente_rep"]     = row[2].strip() if len(row) > 2 else ""
+                    break
+        except Exception as e:
+            log.warning(f"Clientes lookup error: {e}")
 
-        if not resultados:
-            await msg.edit_text(f"📭 Sin resultados para `{query}`.", parse_mode="Markdown")
-            return
+        # ── 2. Buscar en 004 Presupuestos ──────────────────────────
+        presupuestos_match = []
+        try:
+            ws_presup  = get_worksheet("004 Presupuestos")
+            presup_data = ws_presup.get_all_values()
+            if presup_data:
+                ph = presup_data[0]
+                def pc(name):
+                    try: return ph.index(name)
+                    except: return -1
+                p_exp    = pc("Expediente")
+                p_cli    = pc("Cliente")
+                p_proy   = pc("Proyecto")
+                p_srv    = pc("Servicio")
+                p_estado = pc("Estado cobro")
+                p_monto  = pc("Monto")
+                p_saldo  = pc("Saldo")
+                for row in presup_data[1:]:
+                    if any(query in cell.lower() for cell in row if cell):
+                        presupuestos_match.append({
+                            "exp":    row[p_exp].strip()    if p_exp    >= 0 and p_exp    < len(row) else "",
+                            "cli":    row[p_cli].strip()    if p_cli    >= 0 and p_cli    < len(row) else "",
+                            "proy":   row[p_proy].strip()   if p_proy   >= 0 and p_proy   < len(row) else "",
+                            "srv":    row[p_srv].strip()    if p_srv    >= 0 and p_srv    < len(row) else "",
+                            "estado": row[p_estado].strip() if p_estado >= 0 and p_estado < len(row) else "",
+                            "monto":  row[p_monto].strip()  if p_monto  >= 0 and p_monto  < len(row) else "",
+                            "saldo":  row[p_saldo].strip()  if p_saldo  >= 0 and p_saldo  < len(row) else "",
+                        })
+        except Exception as e:
+            log.warning(f"Presupuestos lookup error: {e}")
 
-        # Totales
-        total_in = total_eg = 0.0
-        for row in resultados:
-            tipo = row[col_tipo].strip() if col_tipo >= 0 and col_tipo < len(row) else ""
+        # Si encontramos cliente pero no presupuestos, buscar con el nombre del cliente
+        if resultado.get("cliente_nombre") and not presupuestos_match:
+            nombre = resultado["cliente_nombre"].lower()
             try:
-                imp = float(str(row[col_imp]).replace(",",".").replace("U$D","").strip()) if col_imp >= 0 and col_imp < len(row) else 0
-                if tipo == "Ingreso": total_in += imp
-                elif tipo == "Egreso": total_eg += abs(imp)
-            except: pass
+                for row in presup_data[1:]:
+                    if any(nombre in cell.lower() for cell in row if cell):
+                        presupuestos_match.append({
+                            "exp":    row[p_exp].strip()    if p_exp    >= 0 and p_exp    < len(row) else "",
+                            "cli":    row[p_cli].strip()    if p_cli    >= 0 and p_cli    < len(row) else "",
+                            "proy":   row[p_proy].strip()   if p_proy   >= 0 and p_proy   < len(row) else "",
+                            "srv":    row[p_srv].strip()    if p_srv    >= 0 and p_srv    < len(row) else "",
+                            "estado": row[p_estado].strip() if p_estado >= 0 and p_estado < len(row) else "",
+                            "monto":  row[p_monto].strip()  if p_monto  >= 0 and p_monto  < len(row) else "",
+                            "saldo":  row[p_saldo].strip()  if p_saldo  >= 0 and p_saldo  < len(row) else "",
+                        })
+            except:
+                pass
 
-        lines = [
-            f'🔍 *Resultados para "{query}" ({len(resultados)} tx)*\n',
-            f"💰 Ingresos: `U$D {total_in:,.2f}` | 💸 Egresos: `U$D {total_eg:,.2f}`\n",
-        ]
-        for row in resultados[:15]:
-            fecha = row[col_fecha].strip() if col_fecha >= 0 and col_fecha < len(row) else ""
-            tipo  = row[col_tipo].strip()  if col_tipo  >= 0 and col_tipo  < len(row) else ""
-            cli   = row[col_cli].strip()   if col_cli   >= 0 and col_cli   < len(row) else ""
-            prv   = row[col_prv].strip()   if col_prv   >= 0 and col_prv   < len(row) else ""
-            exp   = row[col_exp].strip()   if col_exp   >= 0 and col_exp   < len(row) else ""
-            imp   = row[col_imp].strip()   if col_imp   >= 0 and col_imp   < len(row) else ""
-            emoji = "💰" if tipo == "Ingreso" else "💸"
-            entidad = cli or prv
-            lines.append(f"{emoji} `{fecha}` {exp} — {entidad} — `{imp}`")
+        # ── 3. Buscar en 003 Transacciones ─────────────────────────
+        tx_match = []
+        try:
+            ws_tx   = get_worksheet("003 Transacciones")
+            tx_data = ws_tx.get_all_values()
+            if tx_data:
+                th = tx_data[0]
+                def tc(name):
+                    try: return th.index(name)
+                    except: return -1
+                t_fecha = tc("Fecha")
+                t_tipo  = tc("Transacción")
+                t_cli   = tc("Cliente")
+                t_prv   = tc("Proveedor")
+                t_exp   = tc("Expediente")
+                t_imp   = tc("Importe USD")
 
-        if len(resultados) > 15:
-            lines.append(f"\n_...y {len(resultados)-15} más_")
+                # Si tenemos expediente de presupuestos, buscar también por eso
+                exp_ids = set(p["exp"].lower() for p in presupuestos_match if p["exp"])
+                cli_nombre = resultado.get("cliente_nombre","").lower()
+
+                for row in tx_data[1:]:
+                    row_text = " ".join(cell.lower() for cell in row if cell)
+                    if query in row_text or any(e in row_text for e in exp_ids) or (cli_nombre and cli_nombre in row_text):
+                        tx_match.append(row)
+        except Exception as e:
+            log.warning(f"Transacciones lookup error: {e}")
+
+        # ── Armar respuesta ─────────────────────────────────────────
+        if not resultado and not presupuestos_match and not tx_match:
+            await msg.edit_text(f"📭 Sin resultados para `{query}`.\nProbá con otro término.", parse_mode="Markdown")
+            return
+
+        lines = [f"🔍 *Resultados para '{query}'*\n"]
+
+        # Cliente encontrado
+        if resultado.get("cliente_nombre"):
+            lines.append(f"👤 *Cliente:* {resultado['cliente_id']} — {resultado['cliente_nombre']}")
+            if resultado.get("cliente_rep"):
+                lines.append(f"  Contacto: {resultado['cliente_rep']}")
+            lines.append("")
+
+        # Presupuestos
+        if presupuestos_match:
+            lines.append(f"📄 *Presupuestos ({len(presupuestos_match)}):*")
+            for p in presupuestos_match[:8]:
+                lines.append(f"• `{p['exp']}` — {p['proy'][:40]}")
+                lines.append(f"  {p['srv']} | Estado: {p['estado']}")
+                lines.append(f"  Monto: {p['monto']} | Saldo: {p['saldo']}")
+            if len(presupuestos_match) > 8:
+                lines.append(f"  _...y {len(presupuestos_match)-8} más_")
+            lines.append("")
+
+        # Transacciones
+        if tx_match:
+            total_in = total_eg = 0.0
+            for row in tx_match:
+                tipo = row[t_tipo].strip() if t_tipo >= 0 and t_tipo < len(row) else ""
+                try:
+                    imp = float(str(row[t_imp]).replace(",",".").replace("U$D","").strip()) if t_imp >= 0 and t_imp < len(row) else 0
+                    if tipo == "Ingreso": total_in += imp
+                    elif tipo == "Egreso": total_eg += abs(imp)
+                except: pass
+
+            lines.append(f"💳 *Transacciones ({len(tx_match)}):*")
+            lines.append(f"  💰 Ingresos: `U$D {total_in:,.2f}` | 💸 Egresos: `U$D {total_eg:,.2f}`")
+            for row in tx_match[-10:]:  # últimas 10
+                fecha = row[t_fecha].strip() if t_fecha >= 0 and t_fecha < len(row) else ""
+                tipo  = row[t_tipo].strip()  if t_tipo  >= 0 and t_tipo  < len(row) else ""
+                cli   = row[t_cli].strip()   if t_cli   >= 0 and t_cli   < len(row) else ""
+                prv   = row[t_prv].strip()   if t_prv   >= 0 and t_prv   < len(row) else ""
+                exp   = row[t_exp].strip()   if t_exp   >= 0 and t_exp   < len(row) else ""
+                imp   = row[t_imp].strip()   if t_imp   >= 0 and t_imp   < len(row) else ""
+                emoji = "💰" if tipo == "Ingreso" else "💸"
+                entidad = cli or prv
+                lines.append(f"{emoji} `{fecha}` `{exp}` {entidad} — `{imp}`")
 
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
+    except Exception as e:
+        log.error(f"Error buscar: {e}")
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Lee comprobante por foto. Solo extrae valores numéricos.
+    El usuario completa el resto en el caption."""
+    user_id = update.effective_user.id
+    if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+        return
+
+    caption = update.message.caption or ""
+    msg = await update.message.reply_text("📸 Leyendo valores del comprobante...")
+
+    try:
+        # Descargar imagen
+        photo  = update.message.photo[-1]
+        file   = await ctx.bot.get_file(photo.file_id)
+        import httpx, base64
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(file.file_path)
+            img_b64 = base64.b64encode(resp.content).decode()
+
+        today = datetime.now().strftime("%m/%d/%Y")
+
+        client_ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp_ai   = client_ai.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Mirá este comprobante y extraé ÚNICAMENTE los valores numéricos que ves. "
+                            "No interpretes nada más. Respondé SOLO con este JSON, sin texto adicional:\n"
+                            "{\n"
+                            '  "monto": número que aparece en el comprobante (el principal, positivo),\n'
+                            '  "fecha": "MM/DD/YYYY si aparece, si no usar ' + today + '",\n'
+                            '  "moneda": "Pesos" o "Dolares" o "Euros" según el símbolo que veas\n'
+                            "}"
+                        )
+                    }
+                ]
+            }]
+        )
+
+        raw = resp_ai.content[0].text.strip().replace("```json","").replace("```","").strip()
+        valores = json.loads(raw)
+
+        # Ahora combinar con el caption del usuario para armar el mensaje completo
+        if caption:
+            mensaje_completo = caption + f" monto {valores.get('monto',0)} {valores.get('moneda','Pesos')} fecha {valores.get('fecha', today)}"
+        else:
+            # Sin caption, pedir que complete
+            await msg.edit_text(
+                f"📸 *Valores leídos del comprobante:*\n\n"
+                f"💵 Monto: `{valores.get('monto', '?')}`\n"
+                f"💱 Moneda: `{valores.get('moneda', '?')}`\n"
+                f"📅 Fecha: `{valores.get('fecha', today)}`\n\n"
+                f"Ahora mandame un mensaje con el resto de los datos:\n"
+                f"_Ej: `ingreso venta de servicio SBMT anticipo F25031`_",
+                parse_mode="Markdown"
+            )
+            # Guardar valores para combinar con el siguiente mensaje
+            ctx.user_data["valores_comprobante"] = valores
+            return
+
+        # Con caption: procesar todo junto
+        presupuestos = get_presupuestos_pendientes()
+        memoria      = get_memoria()
+        presup_ctx   = ""
+        if presupuestos:
+            lines = "\n".join([
+                f"  {p['expediente']} | {p['cliente']} | {p['proyecto']} | Estado: {p['estado']} | Saldo: {p['saldo']}"
+                for p in presupuestos
+            ])
+            presup_ctx = f"\n\nPRESUPUESTOS:\n{lines}"
+
+        parsed = parse_with_claude(mensaje_completo)
+        # Sobreescribir con los valores exactos del comprobante
+        parsed["monto"]  = valores.get("monto", parsed.get("monto", 0))
+        parsed["moneda"] = valores.get("moneda", parsed.get("moneda", "Pesos"))
+        parsed["fecha"]  = valores.get("fecha", parsed.get("fecha", today))
+        if parsed.get("tipo") == "Ingreso":
+            parsed["importe"] = parsed["monto"]
+        else:
+            parsed["importe"] = -abs(parsed["monto"])
+
+        ctx.user_data["pending"] = {"parsed": parsed, "original": f"[foto] {caption}"}
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirmar y guardar", callback_data="confirm"),
+             InlineKeyboardButton("❌ Cancelar",            callback_data="cancel")],
+            [InlineKeyboardButton("✏️ Corregir",            callback_data="edit")]
+        ])
+        await msg.edit_text(
+            "📸 *Comprobante procesado*\n\n" + format_confirmation(parsed),
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+
+    except json.JSONDecodeError:
+        await msg.edit_text(
+            "❌ No pude leer los valores del comprobante.\n"
+            "Probá con una foto más nítida, o escribí el monto manualmente."
+        )
+    except Exception as e:
+        log.error(f"Error foto: {e}")
+        await msg.edit_text(f"❌ Error al procesar la imagen: `{e}`", parse_mode="Markdown")
+
+
+async def cmd_aprender(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Permite al usuario enseñarle al bot una corrección manual."""
+    args = ctx.args
+    if not args or len(args) < 3:
+        await update.message.reply_text(
+            "📚 *Cómo enseñarle al bot*\n\n"
+            "Formato: `/aprender [tipo] [original] → [correcto]`\n\n"
+            "*Ejemplos:*\n"
+            "`/aprender cliente sbmt SBMT Arquitectura`\n"
+            "`/aprender categoria honorarios Venta de servicio`\n"
+            "`/aprender cuenta galicia C.A. Galicia AR$`\n\n"
+            "El bot recordará esta corrección en todas las operaciones futuras.",
+            parse_mode="Markdown"
+        )
+        return
+    tipo     = args[0]
+    original = args[1]
+    correcto = " ".join(args[2:])
+    guardar_aprendizaje(tipo, original, correcto)
+    await update.message.reply_text(
+        f"✅ *¡Aprendido!*\n\n"
+        f"Tipo: `{tipo}`\n"
+        f"Cuando digas `{original}` → lo voy a interpretar como `{correcto}`\n\n"
+        f"_Guardado en Bot_Memoria_",
+        parse_mode="Markdown"
+    )
+
+async def cmd_memoria(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Muestra todo lo que el bot ha aprendido."""
+    try:
+        ws   = get_or_create_memoria_sheet()
+        data = ws.get_all_values() if ws else []
+        if len(data) < 2:
+            await update.message.reply_text("📭 El bot aún no tiene aprendizajes guardados.\nUsá `/aprender` para enseñarle.")
+            return
+        lines = "\n".join([f"• [{r[1]}] `{r[2]}` → `{r[3]}`" for r in data[1:] if len(r) >= 4])
+        await update.message.reply_text(
+            f"📚 *Memoria del bot ({len(data)-1} aprendizajes)*\n\n{lines}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_cobrar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Proyectos con saldo pendiente desde 005 Proyectos por cobrar."""
+    msg = await update.message.reply_text("⏳ Consultando proyectos por cobrar...")
+    try:
+        ws   = get_worksheet("005 Proyectos por cobrar")
+        data = ws.get_all_values()
+        if len(data) < 2:
+            await msg.edit_text("📭 No hay datos en Proyectos por cobrar.")
+            return
+
+        # Estructura: Moneda | Aux (Expediente - Proyecto - Cliente) | Presupuesto | Cobrado | Saldo
+        pendientes = []
+        for row in data[1:]:
+            if len(row) < 5:
+                continue
+            moneda = row[0].strip()
+            aux    = row[1].strip()   # "F25077 - YPF Campana - Fontana"
+            saldo  = row[4].strip()   # "$1,000,000.00"
+            if not aux or not saldo:
+                continue
+            # Parsear saldo
+            saldo_num_str = saldo.replace("$","").replace(".","").replace(",",".").strip()
+            try:
+                saldo_num = float(saldo_num_str)
+                if saldo_num <= 0:
+                    continue
+            except:
+                continue
+            # Parsear Aux: "F25077 - YPF Campana - Fontana"
+            partes = aux.split(" - ", 2)
+            exp    = partes[0].strip() if len(partes) > 0 else ""
+            proy   = partes[1].strip() if len(partes) > 1 else ""
+            cli    = partes[2].strip() if len(partes) > 2 else ""
+            presup = row[2].strip() if len(row) > 2 else ""
+            cobrado= row[3].strip() if len(row) > 3 else ""
+            pendientes.append({
+                "exp": exp, "proy": proy, "cli": cli,
+                "moneda": moneda, "presup": presup,
+                "cobrado": cobrado, "saldo": saldo
+            })
+
+        if not pendientes:
+            await msg.edit_text("✅ No hay proyectos con saldo pendiente.")
+            return
+
+        total = len(pendientes)
+        lines = [f"📋 *Proyectos por cobrar ({total})*\n"]
+        for p in pendientes[:20]:
+            mon_emoji = "💵" if "USD" in p["moneda"].upper() else "💰"
+            lines.append(f"{mon_emoji} `{p['exp']}` — *{p['cli'] or p['proy']}*")
+            if p['proy']: lines.append(f"  _{p['proy'][:45]}_")
+            lines.append(f"  Presup: {p['presup']} | Cobrado: {p['cobrado']}")
+            lines.append(f"  *Saldo: {p['saldo']}* ({p['moneda']})")
+        if total > 20:
+            lines.append(f"\n_...y {total-20} más_")
+
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        log.error(f"Error cobrar: {e}")
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+
+
+async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Búsqueda inteligente: acepta expediente, cliente o proyecto.
+    Cruza 001 Clientes + 004 Presupuestos + 003 Transacciones para completar info faltante."""
+    if not ctx.args:
+        await update.message.reply_text(
+            "🔍 *Buscar*\n\n"
+            "Uso: `/buscar [término]`\n\n"
+            "Podés buscar por:\n"
+            "• Expediente: `/buscar F25031`\n"
+            "• Cliente: `/buscar SBMT`\n"
+            "• Proyecto: `/buscar Campana`\n\n"
+            "El bot busca en clientes, presupuestos y transacciones automáticamente.",
+            parse_mode="Markdown"
+        )
+        return
+
+    query = " ".join(ctx.args).lower().strip()
+    msg   = await update.message.reply_text(f"🔍 Buscando `{query}`...", parse_mode="Markdown")
+
+    try:
+        resultado = {}
+
+        # ── 1. Buscar en 001 Clientes ──────────────────────────────
+        try:
+            ws_cli  = get_worksheet("001 Clientes")
+            cli_data = ws_cli.get_all_values()
+            for row in cli_data[1:]:
+                if any(query in cell.lower() for cell in row if cell):
+                    resultado["cliente_id"]     = row[0].strip() if len(row) > 0 else ""
+                    resultado["cliente_nombre"]  = row[1].strip() if len(row) > 1 else ""
+                    resultado["cliente_rep"]     = row[2].strip() if len(row) > 2 else ""
+                    break
+        except Exception as e:
+            log.warning(f"Clientes lookup error: {e}")
+
+        # ── 2. Buscar en 004 Presupuestos ──────────────────────────
+        presupuestos_match = []
+        try:
+            ws_presup  = get_worksheet("004 Presupuestos")
+            presup_data = ws_presup.get_all_values()
+            if presup_data:
+                ph = presup_data[0]
+                def pc(name):
+                    try: return ph.index(name)
+                    except: return -1
+                p_exp    = pc("Expediente")
+                p_cli    = pc("Cliente")
+                p_proy   = pc("Proyecto")
+                p_srv    = pc("Servicio")
+                p_estado = pc("Estado cobro")
+                p_monto  = pc("Monto")
+                p_saldo  = pc("Saldo")
+                for row in presup_data[1:]:
+                    if any(query in cell.lower() for cell in row if cell):
+                        presupuestos_match.append({
+                            "exp":    row[p_exp].strip()    if p_exp    >= 0 and p_exp    < len(row) else "",
+                            "cli":    row[p_cli].strip()    if p_cli    >= 0 and p_cli    < len(row) else "",
+                            "proy":   row[p_proy].strip()   if p_proy   >= 0 and p_proy   < len(row) else "",
+                            "srv":    row[p_srv].strip()    if p_srv    >= 0 and p_srv    < len(row) else "",
+                            "estado": row[p_estado].strip() if p_estado >= 0 and p_estado < len(row) else "",
+                            "monto":  row[p_monto].strip()  if p_monto  >= 0 and p_monto  < len(row) else "",
+                            "saldo":  row[p_saldo].strip()  if p_saldo  >= 0 and p_saldo  < len(row) else "",
+                        })
+        except Exception as e:
+            log.warning(f"Presupuestos lookup error: {e}")
+
+        # Si encontramos cliente pero no presupuestos, buscar con el nombre del cliente
+        if resultado.get("cliente_nombre") and not presupuestos_match:
+            nombre = resultado["cliente_nombre"].lower()
+            try:
+                for row in presup_data[1:]:
+                    if any(nombre in cell.lower() for cell in row if cell):
+                        presupuestos_match.append({
+                            "exp":    row[p_exp].strip()    if p_exp    >= 0 and p_exp    < len(row) else "",
+                            "cli":    row[p_cli].strip()    if p_cli    >= 0 and p_cli    < len(row) else "",
+                            "proy":   row[p_proy].strip()   if p_proy   >= 0 and p_proy   < len(row) else "",
+                            "srv":    row[p_srv].strip()    if p_srv    >= 0 and p_srv    < len(row) else "",
+                            "estado": row[p_estado].strip() if p_estado >= 0 and p_estado < len(row) else "",
+                            "monto":  row[p_monto].strip()  if p_monto  >= 0 and p_monto  < len(row) else "",
+                            "saldo":  row[p_saldo].strip()  if p_saldo  >= 0 and p_saldo  < len(row) else "",
+                        })
+            except:
+                pass
+
+        # ── 3. Buscar en 003 Transacciones ─────────────────────────
+        tx_match = []
+        try:
+            ws_tx   = get_worksheet("003 Transacciones")
+            tx_data = ws_tx.get_all_values()
+            if tx_data:
+                th = tx_data[0]
+                def tc(name):
+                    try: return th.index(name)
+                    except: return -1
+                t_fecha = tc("Fecha")
+                t_tipo  = tc("Transacción")
+                t_cli   = tc("Cliente")
+                t_prv   = tc("Proveedor")
+                t_exp   = tc("Expediente")
+                t_imp   = tc("Importe USD")
+
+                # Si tenemos expediente de presupuestos, buscar también por eso
+                exp_ids = set(p["exp"].lower() for p in presupuestos_match if p["exp"])
+                cli_nombre = resultado.get("cliente_nombre","").lower()
+
+                for row in tx_data[1:]:
+                    row_text = " ".join(cell.lower() for cell in row if cell)
+                    if query in row_text or any(e in row_text for e in exp_ids) or (cli_nombre and cli_nombre in row_text):
+                        tx_match.append(row)
+        except Exception as e:
+            log.warning(f"Transacciones lookup error: {e}")
+
+        # ── Armar respuesta ─────────────────────────────────────────
+        if not resultado and not presupuestos_match and not tx_match:
+            await msg.edit_text(f"📭 Sin resultados para `{query}`.\nProbá con otro término.", parse_mode="Markdown")
+            return
+
+        lines = [f"🔍 *Resultados para '{query}'*\n"]
+
+        # Cliente encontrado
+        if resultado.get("cliente_nombre"):
+            lines.append(f"👤 *Cliente:* {resultado['cliente_id']} — {resultado['cliente_nombre']}")
+            if resultado.get("cliente_rep"):
+                lines.append(f"  Contacto: {resultado['cliente_rep']}")
+            lines.append("")
+
+        # Presupuestos
+        if presupuestos_match:
+            lines.append(f"📄 *Presupuestos ({len(presupuestos_match)}):*")
+            for p in presupuestos_match[:8]:
+                lines.append(f"• `{p['exp']}` — {p['proy'][:40]}")
+                lines.append(f"  {p['srv']} | Estado: {p['estado']}")
+                lines.append(f"  Monto: {p['monto']} | Saldo: {p['saldo']}")
+            if len(presupuestos_match) > 8:
+                lines.append(f"  _...y {len(presupuestos_match)-8} más_")
+            lines.append("")
+
+        # Transacciones
+        if tx_match:
+            total_in = total_eg = 0.0
+            for row in tx_match:
+                tipo = row[t_tipo].strip() if t_tipo >= 0 and t_tipo < len(row) else ""
+                try:
+                    imp = float(str(row[t_imp]).replace(",",".").replace("U$D","").strip()) if t_imp >= 0 and t_imp < len(row) else 0
+                    if tipo == "Ingreso": total_in += imp
+                    elif tipo == "Egreso": total_eg += abs(imp)
+                except: pass
+
+            lines.append(f"💳 *Transacciones ({len(tx_match)}):*")
+            lines.append(f"  💰 Ingresos: `U$D {total_in:,.2f}` | 💸 Egresos: `U$D {total_eg:,.2f}`")
+            for row in tx_match[-10:]:  # últimas 10
+                fecha = row[t_fecha].strip() if t_fecha >= 0 and t_fecha < len(row) else ""
+                tipo  = row[t_tipo].strip()  if t_tipo  >= 0 and t_tipo  < len(row) else ""
+                cli   = row[t_cli].strip()   if t_cli   >= 0 and t_cli   < len(row) else ""
+                prv   = row[t_prv].strip()   if t_prv   >= 0 and t_prv   < len(row) else ""
+                exp   = row[t_exp].strip()   if t_exp   >= 0 and t_exp   < len(row) else ""
+                imp   = row[t_imp].strip()   if t_imp   >= 0 and t_imp   < len(row) else ""
+                emoji = "💰" if tipo == "Ingreso" else "💸"
+                entidad = cli or prv
+                lines.append(f"{emoji} `{fecha}` `{exp}` {entidad} — `{imp}`")
+
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
     except Exception as e:
         log.error(f"Error buscar: {e}")
         await msg.edit_text(f"❌ Error: `{e}`", parse_mode="Markdown")
@@ -929,6 +1415,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text or text.startswith("/"):
         return
+
+    # Si hay valores de comprobante pendientes, combinarlos con este mensaje
+    if ctx.user_data.get("valores_comprobante"):
+        valores = ctx.user_data.pop("valores_comprobante")
+        texto_completo = text + f" monto {valores.get('monto',0)} {valores.get('moneda','Pesos')} fecha {valores.get('fecha','')}"
+        text = texto_completo
 
     # Si hay una corrección pendiente, guardala como aprendizaje
     if ctx.user_data.get("awaiting_correction"):

@@ -1405,6 +1405,117 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.error(f"Error foto: {e}")
         await msg.edit_text(f"❌ Error al procesar la imagen: `{e}`", parse_mode="Markdown")
 
+
+def enriquecer_transaccion(parsed: dict) -> dict:
+    """
+    Busca en 001 Clientes y 004 Presupuestos para completar
+    expediente, cliente y proyecto si faltan.
+    Devuelve parsed enriquecido + lista de campos que completó.
+    """
+    completados = []
+    tiene_exp    = bool(parsed.get("expediente","").strip())
+    tiene_cli    = bool(parsed.get("cliente","").strip())
+    tiene_proy   = bool(parsed.get("proyecto","").strip())
+
+    # Cargar presupuestos una sola vez
+    try:
+        ws_presup  = get_worksheet("004 Presupuestos")
+        presup_data = ws_presup.get_all_values()
+        ph = presup_data[0] if presup_data else []
+        def pc(name):
+            try: return ph.index(name)
+            except: return -1
+        p_exp  = pc("Expediente")
+        p_cli  = pc("Cliente")
+        p_proy = pc("Proyecto")
+        p_srv  = pc("Servicio")
+        p_saldo= pc("Saldo")
+        p_cobro= pc("Estado cobro")
+    except Exception as e:
+        log.warning(f"No se pudieron cargar presupuestos: {e}")
+        presup_data = []
+
+    # Cargar clientes
+    try:
+        ws_cli   = get_worksheet("001 Clientes")
+        cli_data = ws_cli.get_all_values()
+    except Exception as e:
+        log.warning(f"No se pudieron cargar clientes: {e}")
+        cli_data = []
+
+    def buscar_presupuesto(campo, valor):
+        """Busca filas en presupuestos donde campo contenga valor."""
+        resultados = []
+        for row in presup_data[1:]:
+            col_idx = p_exp if campo == "exp" else p_cli if campo == "cli" else p_proy
+            if col_idx >= 0 and col_idx < len(row):
+                if valor.lower() in row[col_idx].lower():
+                    resultados.append({
+                        "expediente": row[p_exp].strip()  if p_exp  >= 0 and p_exp  < len(row) else "",
+                        "cliente":    row[p_cli].strip()  if p_cli  >= 0 and p_cli  < len(row) else "",
+                        "proyecto":   row[p_proy].strip() if p_proy >= 0 and p_proy < len(row) else "",
+                        "servicio":   row[p_srv].strip()  if p_srv  >= 0 and p_srv  < len(row) else "",
+                        "saldo":      row[p_saldo].strip()if p_saldo>= 0 and p_saldo< len(row) else "",
+                        "estado":     row[p_cobro].strip()if p_cobro>= 0 and p_cobro< len(row) else "",
+                    })
+        return resultados
+
+    # ── Si tiene expediente, buscar cliente y proyecto ────────────
+    if tiene_exp and (not tiene_cli or not tiene_proy):
+        matches = buscar_presupuesto("exp", parsed["expediente"])
+        if matches:
+            m = matches[0]
+            if not tiene_cli and m["cliente"]:
+                parsed["cliente"] = m["cliente"]
+                completados.append(f"cliente: `{m['cliente']}`")
+            if not tiene_proy and m["proyecto"]:
+                parsed["proyecto"] = m["proyecto"]
+                completados.append(f"proyecto: `{m['proyecto']}`")
+
+    # ── Si tiene cliente, buscar expediente y proyecto ────────────
+    elif tiene_cli and not tiene_exp:
+        # Primero normalizar cliente buscando en 001 Clientes
+        cli_raw  = parsed["cliente"].replace("CLI","").strip()
+        cli_norm = ""
+        for row in cli_data[1:]:
+            if len(row) >= 2:
+                if cli_raw.lower() in row[1].lower() or (len(row) > 0 and cli_raw.lower() in row[0].lower()):
+                    cli_norm = row[1].strip()
+                    break
+
+        buscar_val = cli_norm or cli_raw
+        matches = buscar_presupuesto("cli", buscar_val)
+
+        if len(matches) == 1:
+            # Solo un presupuesto → completar automáticamente
+            m = matches[0]
+            if not tiene_exp and m["expediente"]:
+                parsed["expediente"] = m["expediente"]
+                completados.append(f"expediente: `{m['expediente']}`")
+            if not tiene_proy and m["proyecto"]:
+                parsed["proyecto"] = m["proyecto"]
+                completados.append(f"proyecto: `{m['proyecto']}`")
+        elif len(matches) > 1:
+            # Múltiples → guardar opciones para preguntar
+            parsed["_opciones_presupuesto"] = matches
+
+    # ── Si tiene proyecto, buscar expediente y cliente ────────────
+    elif tiene_proy and not tiene_exp:
+        matches = buscar_presupuesto("proy", parsed["proyecto"])
+        if len(matches) == 1:
+            m = matches[0]
+            if not tiene_exp and m["expediente"]:
+                parsed["expediente"] = m["expediente"]
+                completados.append(f"expediente: `{m['expediente']}`")
+            if not tiene_cli and m["cliente"]:
+                parsed["cliente"] = m["cliente"]
+                completados.append(f"cliente: `{m['cliente']}`")
+        elif len(matches) > 1:
+            parsed["_opciones_presupuesto"] = matches
+
+    parsed["_completados"] = completados
+    return parsed
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handler principal: interpreta con Claude y pide confirmación."""
     user_id = update.effective_user.id
@@ -1414,6 +1525,49 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
     if not text or text.startswith("/"):
+        return
+
+    # Si el usuario está eligiendo entre opciones de presupuesto
+    if ctx.user_data.get("awaiting_opcion"):
+        ctx.user_data.pop("awaiting_opcion")
+        pending  = ctx.user_data.get("pending", {})
+        parsed   = pending.get("parsed", {})
+        opciones = pending.get("opciones", [])
+        original = pending.get("original", text)
+        eleccion = text.strip()
+
+        # Intentar por número
+        opcion_elegida = None
+        if eleccion.isdigit():
+            idx = int(eleccion) - 1
+            if 0 <= idx < len(opciones):
+                opcion_elegida = opciones[idx]
+        else:
+            # Buscar por expediente o texto
+            for op in opciones:
+                if eleccion.lower() in op["expediente"].lower() or eleccion.lower() in op["proyecto"].lower():
+                    opcion_elegida = op
+                    break
+
+        if not opcion_elegida and opciones:
+            opcion_elegida = opciones[0]  # Fallback: primera opción
+
+        if opcion_elegida:
+            parsed["expediente"] = opcion_elegida["expediente"]
+            parsed["cliente"]    = opcion_elegida["cliente"]
+            parsed["proyecto"]   = opcion_elegida["proyecto"]
+
+        ctx.user_data["pending"] = {"parsed": parsed, "original": original}
+        confirmacion = (
+            f"✅ _Expediente seleccionado: `{parsed.get('expediente','')}`_\n\n"
+            + format_confirmation(parsed)
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirmar y guardar", callback_data="confirm"),
+             InlineKeyboardButton("❌ Cancelar",            callback_data="cancel")],
+            [InlineKeyboardButton("✏️ Corregir",            callback_data="edit")]
+        ])
+        await update.message.reply_text(confirmacion, parse_mode="Markdown", reply_markup=kb)
         return
 
     # Si hay valores de comprobante pendientes, combinarlos con este mensaje
@@ -1447,8 +1601,31 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Error con Claude IA:\n`{e}`", parse_mode="Markdown")
         return
 
-    # Guardar en user_data para confirmar
+    # ── Enriquecer: buscar campos faltantes en clientes y presupuestos ──
+    await msg.edit_text("🔍 Buscando expediente y cliente en la planilla...")
+    parsed = enriquecer_transaccion(parsed)
+
+    opciones = parsed.pop("_opciones_presupuesto", None)
+    completados = parsed.pop("_completados", [])
+
+    # ── Si hay múltiples presupuestos para el cliente → preguntar cuál ──
+    if opciones:
+        ctx.user_data["pending"] = {"parsed": parsed, "original": text, "opciones": opciones}
+        lines = ["❓ *¿A qué proyecto corresponde?*\n"]
+        for i, op in enumerate(opciones[:8]):
+            saldo_info = f" | Saldo: {op['saldo']}" if op.get("saldo") else ""
+            lines.append(f"`{i+1}.` `{op['expediente']}` — {op['proyecto'][:40]}{saldo_info}")
+        lines.append("\nRespondé con el número o escribí el expediente directamente.")
+        ctx.user_data["awaiting_opcion"] = True
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    # ── Guardar y mostrar confirmación con campos completados ──────────
     ctx.user_data["pending"] = {"parsed": parsed, "original": text}
+
+    confirmacion = format_confirmation(parsed)
+    if completados:
+        confirmacion = f"🔎 _Completé automáticamente: {', '.join(completados)}_\n\n" + confirmacion
 
     kb = InlineKeyboardMarkup([
         [
@@ -1456,15 +1633,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Cancelar",            callback_data="cancel"),
         ],
         [
-            InlineKeyboardButton("✏️ Corregir datos",      callback_data="edit"),
+            InlineKeyboardButton("✏️ Corregir",            callback_data="edit"),
         ]
     ])
 
-    await msg.edit_text(
-        format_confirmation(parsed),
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
+    await msg.edit_text(confirmacion, parse_mode="Markdown", reply_markup=kb)
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Maneja los botones de confirmación/cancelación."""

@@ -1,0 +1,639 @@
+"""
+Bot de Telegram — Sky Ingeniería Cashflow
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Usa Claude IA para interpretar mensajes y registrarlos en
+Google Sheets (hoja: 003 Transacciones) con la estructura exacta
+de SKY-FNN-DOC-001-Cash Flow_BETA.
+
+INSTALACIÓN:
+    pip install python-telegram-bot==20.7 anthropic gspread google-auth python-dotenv
+
+ARCHIVO .env requerido:
+    TELEGRAM_TOKEN=...
+    ANTHROPIC_API_KEY=...
+    GOOGLE_SHEET_ID=1YbxA1K_EnLMGC44o9159LiyLrii5Gi8F2a-H3mRf8us
+    GOOGLE_CREDS_FILE=credentials.json
+    ALLOWED_USER_ID=...   (tu user_id de Telegram — conseguilo con @userinfobot)
+"""
+
+import os, json, logging
+from datetime import datetime, date
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
+import anthropic
+import gspread
+from google.oauth2.service_account import Credentials
+
+load_dotenv()
+
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GOOGLE_SHEET_ID   = os.getenv("GOOGLE_SHEET_ID", "")
+GOOGLE_CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "credentials.json")
+ALLOWED_USER_ID   = int(os.getenv("ALLOWED_USER_ID", "0")) or None
+
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────
+# CONOCIMIENTO DE LA PLANILLA
+# Estructura real de SKY-FNN-DOC-001-Cash Flow_BETA
+# ─────────────────────────────────────────────────────────
+
+# 000 Plan de Cuentas — cuentas reales con código
+CUENTAS_ORIGEN = {
+    # Cajas (Activos)
+    "1100": "1100-Mostrador AR$",
+    "1200": "1200-Mostrador U$D",
+    "1300": "1300-Mostrador EU",
+    "1400": "1400-C.A. Galicia AR$",
+    "1500": "1500-C.A. Galicia U$D",
+    "1600": "1600-C.C. Galicia AR$",
+    "1700": "1700-C.C. Galicia U$D",
+    "1800": "1800-C.A. Wise EU",
+    "1900": "1900-C.A. Prex UY U$D",
+}
+
+CUENTAS_DESTINO_INGRESO = {
+    "2100": "2100-DE Vivienda Unifamiliar",
+    "2200": "2200-DE Vivienda Multifamiliar",
+    "2300": "2300-DE Obras Civiles",
+    "2400": "2400-DE Reformas",
+    "2500": "2500-Informe Técnico",
+    "2600": "2600-Visita a Obra",
+    "2900": "2900-Otros ingresos",
+}
+
+CUENTAS_DESTINO_EGRESO = {
+    "3100": "3100-Salarios operativos",
+    "4100": "4100-Salarios administrativos",
+    "4200": "4200-Infraestructura de software",
+    "4300": "4300-Infraestructura física",
+    "4400": "4400-Marketing y publicidad",
+    "4500": "4500-Formación",
+    "4600": "4600-Contador",
+    "4700": "4700-Impuestos",
+    "4800": "4800-Comisiones bancarias",
+    "4900": "4900-Devoluciones",
+    "4950": "4950-Otros gastos",
+    "5100": "5100-Dividendos pagados",
+}
+
+# 001 Clientes
+CLIENTES = {
+    "CLI001": "CLI001 - Edifizzi",
+    "CLI002": "CLI002 - Analia Valle",
+    "CLI003": "CLI003 - DBM",
+    "CLI004": "CLI004 - SBMT Arquitectura",
+    "CLI005": "CLI005 - BK Kreative Buildings",
+    "CLI006": "CLI006 - MC Construcciones",
+    "CLI007": "CLI007 - Estudio Rillo",
+    "CLI008": "CLI008 - Pi Constructora",
+    "CLI010": "CLI010 - Florencia Funes",
+    "CLI013": "CLI013 - Rameh",
+    "CLI019": "CLI019 - Leone Loray",
+    "CLI021": "CLI021 - LGI",
+    "CLI023": "CLI023 - Damke",
+    "CLI025": "CLI025 - Arq. Indus",
+    "CLI026": "CLI026 - Grupo SIEI",
+    "CLI027": "CLI027 - Grupo Frali",
+    "CLI029": "CLI029 - Arre",
+    "CLI030": "CLI030 - Zerep",
+    "CLI031": "CLI031 - Alejandro Fontana",
+    "CLI032": "CLI032 - Crespo",
+    "CLI033": "CLI033 - Nestor Lisi",
+    "CLI034": "CLI034 - OMH Arquitectos",
+    "CLI036": "CLI036 - IDEA",
+    "CLI039": "CLI039 - Cubi",
+    "CLI040": "CLI040 - Montaldo",
+    "CLI041": "CLI041 - Volk",
+    "CLI042": "CLI042 - Stark",
+    "CLI044": "CLI044 - Ines Gonzalez",
+    "CLI045": "CLI045 - Estudio Sauton",
+    "CLI050": "CLI050 - Kubo Arch",
+    "CLI067": "CLI067 - Mik Arquitectas",
+    "CLI900": "CLI900 - Otros",
+}
+
+# 002 Proveedores
+PROVEEDORES = {
+    "PRV001": "PRV001 - Federico Alonso",
+    "PRV002": "PRV002 - Gastón Argarañaz",
+    "PRV003": "PRV003 - Daniel Tapia",
+    "PRV004": "PRV004 - Andrea Palumbo",
+    "PRV005": "PRV005 - Agencia de Marketing",
+    "PRV006": "PRV006 - Contador",
+    "PRV007": "PRV007 - ARCA / ARBA",
+    "PRV008": "PRV008 - Banco Galicia",
+    "PRV009": "PRV009 - Meta Ads",
+    "PRV900": "PRV900 - Otros",
+    "PRV901": "PRV901 - Ignacio Blois",
+    "PRV902": "PRV902 - Ignacio Mignone",
+    "PRV903": "PRV903 - Freelancer X",
+}
+
+# ─────────────────────────────────────────────────────────
+# PROMPT PARA CLAUDE
+# ─────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """Sos el asistente financiero de Sky Ingeniería, empresa de ingeniería estructural argentina.
+Interpretás mensajes y extraés datos para registrar en la planilla de cashflow (hoja: 003 Transacciones).
+
+ESTRUCTURA EXACTA DE LA HOJA (19 columnas en orden):
+1. Fecha — DD/MM/YYYY
+2. Transacción — "Ingreso" o "Egreso"
+3. Cuenta Origen — de dónde sale el dinero (código-nombre)
+4. Cuenta Destino — hacia dónde va (código-nombre)
+5. Moneda — "Pesos", "Dolares" o "Euros"
+6. Importe — monto positivo para ingresos, NEGATIVO para egresos
+7. Factura — "S/Factura" o "C/Factura"
+8. Cliente — código CLI### - Nombre (solo en ingresos, vacío en egresos)
+9. Proveedor — código PRV### - Nombre (solo en egresos, vacío en ingresos)
+10. Expediente — código F25XXX si se menciona, sino vacío
+11. Proyecto — descripción del proyecto (F25XXX - descripcion - Cliente)
+12-19. Calculados automáticamente (Dolar, EUR/USD, Importe USD, ID Fecha, Year, Quarter, Month, YYYY-MM)
+
+CUENTAS ORIGEN (dónde está la plata):
+- 1100-Mostrador AR$ → efectivo en pesos
+- 1200-Mostrador U$D → efectivo en dólares
+- 1300-Mostrador EU → efectivo en euros
+- 1400-C.A. Galicia AR$ → cuenta bancaria pesos
+- 1500-C.A. Galicia U$D → cuenta bancaria dólares
+- 1600-C.C. Galicia AR$ → cuenta corriente pesos
+- 1900-C.A. Prex UY U$D → cuenta Prex dólares
+
+CUENTAS DESTINO PARA INGRESOS:
+- 2100-DE Vivienda Unifamiliar → diseño estructural casa individual
+- 2200-DE Vivienda Multifamiliar → edificio, duplex, multifamiliar
+- 2300-DE Obras Civiles → obras civiles, industrial
+- 2400-DE Reformas → reforma, remodelación
+- 2500-Informe Técnico → informe, certificado, pericia
+- 2600-Visita a Obra → visita, inspección
+- 2900-Otros ingresos → cualquier otro ingreso
+
+CUENTAS DESTINO PARA EGRESOS:
+- 3100-Salarios operativos → sueldos del equipo técnico
+- 4100-Salarios administrativos → sueldos del área admin
+- 4200-Infraestructura de software → software, licencias, apps
+- 4300-Infraestructura física → alquiler, equipos, mobiliario
+- 4400-Marketing y publicidad → publicidad, redes, agencia
+- 4500-Formación → cursos, capacitación
+- 4600-Contador → honorarios del contador
+- 4700-Impuestos → ARCA, ARBA, monotributo, impuestos
+- 4800-Comisiones bancarias → comisiones del banco
+- 4900-Devoluciones → devolución a cliente
+- 4950-Otros gastos → cualquier otro gasto
+- 5100-Dividendos pagados → dividendos
+
+CLIENTES FRECUENTES (usar el código CLI###):
+SBMT Arquitectura=CLI004, BK Kreative Buildings=CLI005, Edifizzi=CLI001,
+Analia Valle=CLI002, Leone Loray=CLI019, Estudio Rillo=CLI007,
+Pi Constructora=CLI008, Rameh=CLI013, MC Construcciones=CLI006,
+Grupo Frali=CLI027, IDEA=CLI036, Kubo Arch=CLI050, Mik Arquitectas=CLI067,
+Cubi=CLI039, OMH Arquitectos=CLI034, LGI=CLI021, Estudio Sauton=CLI045
+
+PROVEEDORES FRECUENTES (usar código PRV###):
+Federico Alonso=PRV001, Gastón Argarañaz=PRV002, Daniel Tapia=PRV003,
+Andrea Palumbo=PRV004, Agencia Marketing=PRV005, Contador=PRV006,
+ARCA/ARBA/impuestos=PRV007, Banco Galicia=PRV008, Meta Ads=PRV009,
+Ignacio Blois=PRV901, Ignacio Mignone=PRV902, Freelancer=PRV903
+
+REGLAS DE INFERENCIA:
+- "cobré/me pagaron/ingreso/anticipo/saldo" → Ingreso
+- "pagué/gasté/egreso/salario/sueldo" → Egreso
+- Sin moneda + monto grande (>5000) → Pesos
+- Sin moneda + monto chico (<5000) con "dólar/usd/dólares" → Dolares
+- Efectivo sin aclarar → Mostrador AR$ (pesos) o Mostrador U$D (dólares)
+- Transferencia → C.A. Galicia AR$ (pesos) o C.A. Galicia U$D (dólares)
+- Vivienda sin aclarar → 2100-DE Vivienda Unifamiliar
+- El importe en la planilla es NEGATIVO para egresos
+- Si cliente no está en la lista → usar CLI900 - Otros
+- Si proveedor no está en la lista → usar PRV900 - Otros
+
+Respondé ÚNICAMENTE con JSON válido, sin texto ni markdown."""
+
+USER_PROMPT = """Fecha de hoy: {today}
+
+Mensaje del usuario: "{message}"
+
+Extraé los datos y respondé con este JSON:
+{{
+  "tipo": "Ingreso" o "Egreso",
+  "fecha": "DD/MM/YYYY",
+  "cuenta_origen": "XXXX-Nombre completo",
+  "cuenta_destino": "XXXX-Nombre completo",
+  "moneda": "Pesos" o "Dolares" o "Euros",
+  "importe": número (positivo si ingreso, NEGATIVO si egreso),
+  "factura": "S/Factura" o "C/Factura",
+  "cliente": "CLIXX - Nombre" o "" (solo si ingreso),
+  "proveedor": "PRVXX - Nombre" o "" (solo si egreso),
+  "expediente": "F25XXX" o "",
+  "proyecto": "descripción del proyecto" o "",
+  "confianza": 0-100,
+  "dudas": "qué no quedó claro" o null
+}}"""
+
+# ─────────────────────────────────────────────────────────
+# GOOGLE SHEETS
+# ─────────────────────────────────────────────────────────
+
+def get_worksheet(sheet_name="003 Transacciones"):
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
+    gc    = gspread.authorize(creds)
+    sh    = gc.open_by_key(GOOGLE_SHEET_ID)
+    return sh.worksheet(sheet_name)
+
+def excel_date(dt: date) -> int:
+    """Número serial de Excel para la fecha."""
+    return (dt - date(1899, 12, 30)).days
+
+def build_row(parsed: dict, dolar_blue: float = 1390.0) -> list:
+    """
+    Construye la fila exacta para 003 Transacciones (19 columnas):
+    Fecha | Transacción | Cuenta Origen | Cuenta Destino | Moneda | Importe |
+    Factura | Cliente | Proveedor | Expediente | Proyecto |
+    Dolar | EUR/USD | Importe USD | ID Fecha | Year | Quarter | Month | YYYY-MM
+    """
+    tx_date = datetime.strptime(parsed["fecha"], "%d/%m/%Y")
+    moneda  = parsed.get("moneda", "Pesos")
+    importe = float(parsed.get("importe", 0))
+
+    # Conversión a USD
+    if moneda == "Pesos":
+        importe_usd = importe / dolar_blue
+    elif moneda == "Dolares":
+        importe_usd = importe
+    else:
+        importe_usd = importe  # Euros: sin conversión exacta
+
+    year    = tx_date.year
+    month   = tx_date.month
+    quarter = (month - 1) // 3 + 1
+    yyyy_mm = f"{year}-{month}"
+
+    return [
+        parsed["fecha"],                                          # 1. Fecha
+        parsed["tipo"],                                           # 2. Transacción
+        parsed.get("cuenta_origen", "1100-Mostrador AR$"),       # 3. Cuenta Origen
+        parsed.get("cuenta_destino", ""),                        # 4. Cuenta Destino
+        moneda,                                                   # 5. Moneda
+        importe,                                                  # 6. Importe
+        parsed.get("factura", "S/Factura"),                      # 7. Factura
+        parsed.get("cliente", ""),                               # 8. Cliente
+        parsed.get("proveedor", ""),                             # 9. Proveedor
+        parsed.get("expediente", ""),                            # 10. Expediente
+        parsed.get("proyecto", ""),                              # 11. Proyecto
+        dolar_blue,                                              # 12. Dolar
+        1.0,                                                     # 13. EUR/USD
+        round(importe_usd, 4),                                   # 14. Importe USD
+        excel_date(tx_date.date()),                              # 15. ID Fecha
+        year,                                                    # 16. Year
+        quarter,                                                 # 17. Quarter
+        month,                                                   # 18. Month
+        yyyy_mm,                                                 # 19. YYYY-MM
+    ]
+
+def append_to_sheet(parsed: dict) -> int:
+    """Inserta la fila y devuelve el número de fila."""
+    ws  = get_worksheet()
+    row = build_row(parsed)
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    return len(ws.col_values(1))  # fila insertada
+
+def get_month_summary() -> dict:
+    """Calcula totales del mes actual en USD."""
+    ws      = get_worksheet()
+    data    = ws.get_all_values()
+    if len(data) < 2:
+        return {"ingresos": 0, "egresos": 0, "balance": 0, "tx_count": 0, "mes": ""}
+
+    headers = data[0]
+    now     = datetime.now()
+    ym      = f"{now.year}-{now.month}"
+
+    try:
+        col_ym      = headers.index("YYYY-MM")
+        col_imp_usd = headers.index("Importe USD")
+        col_tipo    = headers.index("Transacción")
+    except ValueError:
+        col_ym, col_imp_usd, col_tipo = 18, 13, 1
+
+    total_in = total_eg = count = 0
+    for row in data[1:]:
+        if len(row) <= col_ym or row[col_ym] != ym:
+            continue
+        try:
+            val  = float(str(row[col_imp_usd]).replace(",", ".") or 0)
+            tipo = row[col_tipo]
+            if tipo == "Ingreso":
+                total_in += val
+            elif tipo == "Egreso":
+                total_eg += abs(val)
+            count += 1
+        except (ValueError, IndexError):
+            continue
+
+    return {
+        "ingresos": round(total_in, 2),
+        "egresos":  round(total_eg, 2),
+        "balance":  round(total_in - total_eg, 2),
+        "tx_count": count,
+        "mes":      f"{now.month}/{now.year}",
+    }
+
+# ─────────────────────────────────────────────────────────
+# CLAUDE IA
+# ─────────────────────────────────────────────────────────
+
+def parse_with_claude(message: str) -> dict:
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    today  = datetime.now().strftime("%d/%m/%Y")
+    resp   = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": USER_PROMPT.format(today=today, message=message)
+        }]
+    )
+    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+# ─────────────────────────────────────────────────────────
+# FORMATO DEL MENSAJE DE CONFIRMACIÓN
+# ─────────────────────────────────────────────────────────
+
+def format_confirmation(parsed: dict) -> str:
+    es_in  = parsed["tipo"] == "Ingreso"
+    emoji  = "💰" if es_in else "💸"
+    imp    = float(parsed.get("importe", 0))
+    sign   = "+" if imp >= 0 else ""
+    sym    = {"Pesos": "$", "Dolares": "U$D", "Euros": "€"}.get(parsed.get("moneda", "Pesos"), "$")
+
+    lines = [
+        f"{emoji} *{parsed['tipo'].upper()} detectado*",
+        "",
+        f"📅 Fecha:          `{parsed.get('fecha', '—')}`",
+        f"💵 Importe:        `{sign}{sym} {abs(imp):,.0f}`",
+        f"🏦 Cuenta Origen:  `{parsed.get('cuenta_origen', '—')}`",
+        f"📂 Cuenta Destino: `{parsed.get('cuenta_destino', '—')}`",
+        f"💳 Moneda:         `{parsed.get('moneda', '—')}`",
+        f"🧾 Factura:        `{parsed.get('factura', 'S/Factura')}`",
+    ]
+
+    if es_in and parsed.get("cliente"):
+        lines.append(f"👤 Cliente:        `{parsed['cliente']}`")
+    if not es_in and parsed.get("proveedor"):
+        lines.append(f"🏭 Proveedor:      `{parsed['proveedor']}`")
+    if parsed.get("expediente"):
+        lines.append(f"📁 Expediente:     `{parsed['expediente']}`")
+    if parsed.get("proyecto"):
+        lines.append(f"🏗️ Proyecto:       `{parsed['proyecto']}`")
+
+    conf = parsed.get("confianza", 100)
+    if conf < 80:
+        lines += ["", f"⚠️ _Confianza: {conf}% — revisá los datos_"]
+    if parsed.get("dudas"):
+        lines.append(f"❓ _Duda: {parsed['dudas']}_")
+
+    lines += ["", "¿Lo registro así en la planilla?"]
+    return "\n".join(lines)
+
+# ─────────────────────────────────────────────────────────
+# HANDLERS DE TELEGRAM
+# ─────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 *Sky Ingeniería — Bot de Cashflow*\n\n"
+        "Mandame una operación y la registro directamente en tu planilla Google Sheets.\n\n"
+        "*Ejemplos de mensajes:*\n"
+        "• `ingreso 500 usd SBMT anticipo F25031`\n"
+        "• `cobré 1.200.000 pesos vivienda unifamiliar Leone Loray saldo`\n"
+        "• `egreso salario Federico 800 dólares`\n"
+        "• `pagué impuestos ARCA 85000 transferencia`\n"
+        "• `gasté 45000 software licencia autocad`\n\n"
+        "*Comandos:*\n"
+        "/resumen — Balance del mes en USD\n"
+        "/cuentas — Ver plan de cuentas\n"
+        "/ayuda — Ayuda completa",
+        parse_mode="Markdown"
+    )
+
+async def cmd_ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Ayuda — Cómo registrar*\n\n"
+        "Describí la operación de forma natural:\n"
+        "`[tipo] [monto] [moneda] [descripción] [cliente/proveedor]`\n\n"
+        "*Palabras clave:*\n"
+        "Ingresos: _cobré, ingreso, anticipo, saldo, me pagaron_\n"
+        "Egresos: _pagué, egreso, salario, gasto, transferí_\n\n"
+        "*Monedas:* pesos / dólares (usd) / euros\n"
+        "*Formas de pago:* efectivo / transferencia\n\n"
+        "/resumen — Totales del mes\n"
+        "/cuentas — Plan de cuentas completo",
+        parse_mode="Markdown"
+    )
+
+async def cmd_cuentas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📊 *Plan de Cuentas*\n\n"
+        "*CUENTAS ORIGEN (de dónde sale):*\n"
+        "`1100` Mostrador AR$ (efectivo $)\n"
+        "`1200` Mostrador U$D (efectivo USD)\n"
+        "`1400` C.A. Galicia AR$\n"
+        "`1500` C.A. Galicia U$D\n\n"
+        "*INGRESOS (cuenta destino):*\n"
+        "`2100` DE Vivienda Unifamiliar\n"
+        "`2200` DE Vivienda Multifamiliar\n"
+        "`2300` DE Obras Civiles\n"
+        "`2400` DE Reformas\n"
+        "`2500` Informe Técnico\n"
+        "`2600` Visita a Obra\n"
+        "`2900` Otros ingresos\n\n"
+        "*EGRESOS (cuenta destino):*\n"
+        "`3100` Salarios operativos\n"
+        "`4100` Salarios administrativos\n"
+        "`4200` Infraestructura de software\n"
+        "`4300` Infraestructura física\n"
+        "`4400` Marketing y publicidad\n"
+        "`4500` Formación\n"
+        "`4600` Contador\n"
+        "`4700` Impuestos\n"
+        "`4800` Comisiones bancarias\n"
+        "`4950` Otros gastos"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def cmd_resumen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ Consultando planilla...")
+    try:
+        s   = get_month_summary()
+        bal = s["balance"]
+        em  = "✅" if bal >= 0 else "🔴"
+        await msg.edit_text(
+            f"📊 *Resumen {s['mes']}*\n\n"
+            f"💰 Ingresos:   `U$D {s['ingresos']:>10,.2f}`\n"
+            f"💸 Egresos:    `U$D {s['egresos']:>10,.2f}`\n"
+            f"{'─' * 30}\n"
+            f"{em} Balance:  `U$D {bal:>10,.2f}`\n\n"
+            f"_📋 {s['tx_count']} transacciones registradas este mes_",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.error(f"Error resumen: {e}")
+        await msg.edit_text(
+            f"❌ Error al leer la planilla:\n`{e}`\n\n"
+            "_Verificá que el bot tenga acceso de editor._",
+            parse_mode="Markdown"
+        )
+
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handler principal: interpreta con Claude y pide confirmación."""
+    user_id = update.effective_user.id
+    if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+        await update.message.reply_text("⛔ Sin acceso autorizado.")
+        return
+
+    text = update.message.text.strip()
+    if not text or text.startswith("/"):
+        return
+
+    msg = await update.message.reply_text("🤖 Analizando con Claude IA...")
+
+    try:
+        parsed = parse_with_claude(text)
+    except json.JSONDecodeError as e:
+        log.error(f"JSON error: {e}")
+        await msg.edit_text(
+            "❌ No pude interpretar ese mensaje.\n\n"
+            "*Probá algo como:*\n"
+            "`ingreso 500 usd SBMT anticipo F25031`\n"
+            "`egreso 85000 pesos salario Federico`",
+            parse_mode="Markdown"
+        )
+        return
+    except Exception as e:
+        log.error(f"Claude error: {e}")
+        await msg.edit_text(f"❌ Error con Claude IA:\n`{e}`", parse_mode="Markdown")
+        return
+
+    # Guardar en user_data para confirmar
+    ctx.user_data["pending"] = {"parsed": parsed, "original": text}
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Confirmar y guardar", callback_data="confirm"),
+            InlineKeyboardButton("❌ Cancelar",            callback_data="cancel"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Corregir datos",      callback_data="edit"),
+        ]
+    ])
+
+    await msg.edit_text(
+        format_confirmation(parsed),
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Maneja los botones de confirmación/cancelación."""
+    query  = update.callback_query
+    action = query.data
+    await query.answer()
+
+    pending = ctx.user_data.get("pending")
+    if not pending:
+        await query.edit_message_text("⚠️ No hay operación pendiente. Mandá un nuevo mensaje.")
+        return
+
+    parsed   = pending["parsed"]
+    original = pending["original"]
+
+    if action == "confirm":
+        await query.edit_message_text("⏳ Guardando en Google Sheets...")
+        try:
+            row_num = append_to_sheet(parsed)
+            es_in   = parsed["tipo"] == "Ingreso"
+            emoji   = "💰" if es_in else "💸"
+            imp     = float(parsed.get("importe", 0))
+            sym     = {"Pesos": "$", "Dolares": "U$D", "Euros": "€"}.get(parsed.get("moneda", "Pesos"), "$")
+            sign    = "+" if imp >= 0 else ""
+            destino = parsed.get("cuenta_destino", "")
+            entidad = parsed.get("cliente", "") or parsed.get("proveedor", "")
+
+            success = (
+                f"{emoji} *¡Guardado en fila {row_num}!*\n\n"
+                f"`{sign}{sym} {abs(imp):,.0f}` → {destino}\n"
+            )
+            if entidad:
+                success += f"_{entidad}_\n"
+            if parsed.get("expediente"):
+                success += f"📁 `{parsed['expediente']}`\n"
+            success += f"\n✅ Registrado en `003 Transacciones`"
+
+            await query.edit_message_text(success, parse_mode="Markdown")
+            ctx.user_data.pop("pending", None)
+
+        except Exception as e:
+            log.error(f"Error guardando: {e}")
+            await query.edit_message_text(
+                f"❌ Error al guardar en la planilla:\n`{e}`\n\n"
+                "_Verificá que el bot tenga permiso de *Editor* en la planilla._",
+                parse_mode="Markdown"
+            )
+
+    elif action == "cancel":
+        await query.edit_message_text(
+            "❌ Operación cancelada.\n_Mandá un nuevo mensaje cuando quieras._",
+            parse_mode="Markdown"
+        )
+        ctx.user_data.pop("pending", None)
+
+    elif action == "edit":
+        await query.edit_message_text(
+            f"✏️ *Corrección*\n\n"
+            f"_Original:_ `{original}`\n\n"
+            "Mandame el mensaje corregido con los datos exactos:",
+            parse_mode="Markdown"
+        )
+        ctx.user_data.pop("pending", None)
+
+# ─────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────
+
+def main():
+    for val, name in [
+        (TELEGRAM_TOKEN,    "TELEGRAM_TOKEN"),
+        (ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY"),
+        (GOOGLE_SHEET_ID,   "GOOGLE_SHEET_ID"),
+    ]:
+        if not val:
+            raise ValueError(f"❌ Falta {name} en el archivo .env")
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("ayuda",   cmd_ayuda))
+    app.add_handler(CommandHandler("cuentas", cmd_cuentas))
+    app.add_handler(CommandHandler("resumen", cmd_resumen))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    log.info("🤖 Sky Ingeniería Bot iniciado — esperando mensajes...")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

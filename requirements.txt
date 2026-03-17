@@ -3,3 +3,4 @@ anthropic
 gspread
 google-auth
 python-dotenv
+httpx

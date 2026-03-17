@@ -24,6 +24,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 import anthropic
+import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -328,12 +329,13 @@ def build_row(parsed: dict, dolar_blue: float = 1390.0) -> list:
         yyyy_mm,                                                 # 19. YYYY-MM
     ]
 
-def append_to_sheet(parsed: dict) -> int:
-    """Inserta la fila y devuelve el número de fila."""
-    ws  = get_worksheet()
-    row = build_row(parsed)
+async def append_to_sheet(parsed: dict) -> int:
+    """Inserta la fila y devuelve el número de fila. Usa cotización blue del día."""
+    dolar = await get_dolar_blue()
+    ws    = get_worksheet()
+    row   = build_row(parsed, dolar_blue=dolar)
     ws.append_row(row, value_input_option="USER_ENTERED")
-    return len(ws.col_values(1))  # fila insertada
+    return len(ws.col_values(1))
 
 def get_month_summary() -> dict:
     """Calcula totales del mes actual en USD."""
@@ -379,6 +381,18 @@ def get_month_summary() -> dict:
 # ─────────────────────────────────────────────────────────
 # CLAUDE IA
 # ─────────────────────────────────────────────────────────
+
+
+async def get_dolar_blue() -> float:
+    """Obtiene la cotización del dólar blue desde dolarapi.com."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get("https://dolarapi.com/v1/dolares/blue")
+            data = r.json()
+            return float(data.get("venta", 1390))
+    except Exception as e:
+        log.warning(f"No se pudo obtener dólar blue: {e}. Usando valor por defecto.")
+        return 1390.0
 
 
 # ─────────────────────────────────────────────────────────
@@ -587,6 +601,10 @@ async def cmd_ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Monedas:* pesos / dólares (usd) / euros\n"
         "*Formas de pago:* efectivo / transferencia\n\n"
         "/resumen — Totales del mes\n"
+        "/cobrar — Proyectos con saldo pendiente\n"
+        "/buscar [término] — Buscar transacciones\n"
+        "/aprender [tipo] [original] [correcto] — Enseñarle al bot\n"
+        "/memoria — Ver aprendizajes guardados\n"
         "/cuentas — Plan de cuentas completo",
         parse_mode="Markdown"
     )
@@ -688,6 +706,219 @@ async def cmd_memoria(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
+
+async def cmd_cobrar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Proyectos con saldo pendiente de cobro desde 005 Proyectos por cobrar."""
+    msg = await update.message.reply_text("⏳ Consultando proyectos por cobrar...")
+    try:
+        ws   = get_worksheet("005 Proyectos por cobrar")
+        data = ws.get_all_values()
+        if len(data) < 2:
+            await msg.edit_text("📭 No hay datos en Proyectos por cobrar.")
+            return
+        headers = data[0]
+        def col(name):
+            try: return headers.index(name)
+            except: return -1
+        col_exp    = col("Expediente")
+        col_cli    = col("Cliente")
+        col_proy   = col("Proyecto")
+        col_saldo  = col("Saldo")
+        col_estado = col("Estado Actual")
+
+        pendientes = []
+        for row in data[1:]:
+            saldo_raw = row[col_saldo].strip() if col_saldo >= 0 and col_saldo < len(row) else ""
+            saldo_num = saldo_raw.replace("$","").replace(".","").replace(",",".").strip()
+            try:
+                if float(saldo_num) <= 0:
+                    continue
+            except:
+                continue
+            pendientes.append({
+                "exp":    row[col_exp].strip()    if col_exp    >= 0 and col_exp    < len(row) else "",
+                "cli":    row[col_cli].strip()    if col_cli    >= 0 and col_cli    < len(row) else "",
+                "proy":   row[col_proy].strip()   if col_proy   >= 0 and col_proy   < len(row) else "",
+                "saldo":  saldo_raw,
+                "estado": row[col_estado].strip() if col_estado >= 0 and col_estado < len(row) else "",
+            })
+
+        if not pendientes:
+            await msg.edit_text("✅ No hay proyectos con saldo pendiente.")
+            return
+
+        lines = [f"📋 *Proyectos por cobrar ({len(pendientes)})*\n"]
+        for p in pendientes[:25]:
+            lines.append(f"• `{p['exp']}` — {p['cli']}")
+            if p['proy']: lines.append(f"  _{p['proy'][:50]}_")
+            lines.append(f"  Saldo: `{p['saldo']}` | {p['estado']}")
+        if len(pendientes) > 25:
+            lines.append(f"\n_...y {len(pendientes)-25} más_")
+
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        log.error(f"Error cobrar: {e}")
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+
+
+async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Busca transacciones por cliente, proveedor o expediente."""
+    if not ctx.args:
+        await update.message.reply_text(
+            "🔍 *Buscar transacciones*\n\n"
+            "Uso: `/buscar [término]`\n\n"
+            "Ejemplos:\n"
+            "`/buscar SBMT` — todas las tx de SBMT\n"
+            "`/buscar F25031` — por expediente\n"
+            "`/buscar Federico` — por proveedor",
+            parse_mode="Markdown"
+        )
+        return
+    query = " ".join(ctx.args).lower()
+    msg   = await update.message.reply_text(f"🔍 Buscando `{query}`...", parse_mode="Markdown")
+    try:
+        ws      = get_worksheet("003 Transacciones")
+        data    = ws.get_all_values()
+        if len(data) < 2:
+            await msg.edit_text("📭 Sin datos en la planilla.")
+            return
+        headers = data[0]
+        def col(name):
+            try: return headers.index(name)
+            except: return -1
+        col_fecha = col("Fecha")
+        col_tipo  = col("Transacción")
+        col_cli   = col("Cliente")
+        col_prv   = col("Proveedor")
+        col_exp   = col("Expediente")
+        col_proy  = col("Proyecto")
+        col_imp   = col("Importe USD")
+
+        resultados = []
+        for row in data[1:]:
+            if any(query in cell.lower() for cell in row):
+                resultados.append(row)
+
+        if not resultados:
+            await msg.edit_text(f"📭 Sin resultados para `{query}`.", parse_mode="Markdown")
+            return
+
+        # Totales
+        total_in = total_eg = 0.0
+        for row in resultados:
+            tipo = row[col_tipo].strip() if col_tipo >= 0 and col_tipo < len(row) else ""
+            try:
+                imp = float(str(row[col_imp]).replace(",",".").replace("U$D","").strip()) if col_imp >= 0 and col_imp < len(row) else 0
+                if tipo == "Ingreso": total_in += imp
+                elif tipo == "Egreso": total_eg += abs(imp)
+            except: pass
+
+        lines = [
+            f'🔍 *Resultados para "{query}" ({len(resultados)} tx)*\n',
+            f"💰 Ingresos: `U$D {total_in:,.2f}` | 💸 Egresos: `U$D {total_eg:,.2f}`\n",
+        ]
+        for row in resultados[:15]:
+            fecha = row[col_fecha].strip() if col_fecha >= 0 and col_fecha < len(row) else ""
+            tipo  = row[col_tipo].strip()  if col_tipo  >= 0 and col_tipo  < len(row) else ""
+            cli   = row[col_cli].strip()   if col_cli   >= 0 and col_cli   < len(row) else ""
+            prv   = row[col_prv].strip()   if col_prv   >= 0 and col_prv   < len(row) else ""
+            exp   = row[col_exp].strip()   if col_exp   >= 0 and col_exp   < len(row) else ""
+            imp   = row[col_imp].strip()   if col_imp   >= 0 and col_imp   < len(row) else ""
+            emoji = "💰" if tipo == "Ingreso" else "💸"
+            entidad = cli or prv
+            lines.append(f"{emoji} `{fecha}` {exp} — {entidad} — `{imp}`")
+
+        if len(resultados) > 15:
+            lines.append(f"\n_...y {len(resultados)-15} más_")
+
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        log.error(f"Error buscar: {e}")
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Procesa fotos/comprobantes usando Claude Vision."""
+    user_id = update.effective_user.id
+    if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+        return
+
+    msg = await update.message.reply_text("📸 Analizando comprobante con Claude Vision...")
+    try:
+        # Obtener la foto de mayor resolución
+        photo   = update.message.photo[-1]
+        file    = await ctx.bot.get_file(photo.file_id)
+        img_url = file.file_path
+
+        # Descargar la imagen
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(img_url)
+            img_bytes  = resp.content
+            img_base64 = __import__('base64').b64encode(img_bytes).decode()
+
+        today  = datetime.now().strftime("%m/%d/%Y")
+        presupuestos = get_presupuestos_pendientes()
+        memoria      = get_memoria()
+        presup_ctx   = ""
+        if presupuestos:
+            lines = "\n".join([
+                f"  {p['expediente']} | {p['cliente']} | {p['proyecto']} | Estado: {p['estado']} | Saldo: {p['saldo']}"
+                for p in presupuestos
+            ])
+            presup_ctx = f"\n\nPRESUPUESTOS PARA CONTEXTUALIZAR:\n{lines}"
+
+        client_ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp_ai   = client_ai.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT + presup_ctx + memoria,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": img_base64,
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": f"Fecha de hoy: {today}\n\nAnalizá este comprobante (transferencia, ticket, factura, captura de banco) y extraé los datos de la transacción.\n\n" + USER_PROMPT.format(today=today, message="[ver imagen adjunta]")
+                    }
+                ]
+            }]
+        )
+        raw    = resp_ai.content[0].text.strip().replace("```json","").replace("```","").strip()
+        parsed = json.loads(raw)
+
+        # Caption como descripción si hay
+        if update.message.caption and not parsed.get("proyecto"):
+            parsed["proyecto"] = update.message.caption
+
+        ctx.user_data["pending"] = {"parsed": parsed, "original": "[comprobante foto]"}
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirmar y guardar", callback_data="confirm"),
+             InlineKeyboardButton("❌ Cancelar",            callback_data="cancel")],
+            [InlineKeyboardButton("✏️ Corregir",            callback_data="edit")]
+        ])
+        await msg.edit_text(
+            "📸 *Comprobante leído*\n\n" + format_confirmation(parsed),
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    except json.JSONDecodeError:
+        await msg.edit_text(
+            "❌ No pude leer los datos del comprobante.\n"
+            "Probá con una foto más nítida o escribí la operación manualmente."
+        )
+    except Exception as e:
+        log.error(f"Error foto: {e}")
+        await msg.edit_text(f"❌ Error al procesar la imagen: `{e}`", parse_mode="Markdown")
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handler principal: interpreta con Claude y pide confirmación."""
     user_id = update.effective_user.id
@@ -760,7 +991,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "confirm":
         await query.edit_message_text("⏳ Guardando en Google Sheets...")
         try:
-            row_num = append_to_sheet(parsed)
+            row_num = await append_to_sheet(parsed)
             es_in   = parsed["tipo"] == "Ingreso"
             emoji   = "💰" if es_in else "💸"
             imp     = float(parsed.get("importe", 0))
@@ -828,6 +1059,9 @@ def main():
     app.add_handler(CommandHandler("resumen", cmd_resumen))
     app.add_handler(CommandHandler("aprender", cmd_aprender))
     app.add_handler(CommandHandler("memoria",  cmd_memoria))
+    app.add_handler(CommandHandler("cobrar",   cmd_cobrar))
+    app.add_handler(CommandHandler("buscar",   cmd_buscar))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

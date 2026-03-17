@@ -193,12 +193,28 @@ CUENTAS DESTINO PARA EGRESOS:
 - 4950-Otros gastos → cualquier otro gasto
 - 5100-Dividendos pagados → dividendos
 
-CLIENTES FRECUENTES (usar el código CLI###):
-SBMT Arquitectura=CLI004, BK Kreative Buildings=CLI005, Edifizzi=CLI001,
-Analia Valle=CLI002, Leone Loray=CLI019, Estudio Rillo=CLI007,
-Pi Constructora=CLI008, Rameh=CLI013, MC Construcciones=CLI006,
-Grupo Frali=CLI027, IDEA=CLI036, Kubo Arch=CLI050, Mik Arquitectas=CLI067,
-Cubi=CLI039, OMH Arquitectos=CLI034, LGI=CLI021, Estudio Sauton=CLI045
+CLIENTES — lista exacta de 001 Clientes (usá SIEMPRE estos nombres y códigos exactos):
+CLI027=Grupo Frali, CLI019=Leone Loray, CLI001=Edifizzi, CLI004=SBMT Arquitectura,
+CLI005=BK Kreative Buildings, CLI039=Cubi, CLI002=Analia Valle, CLI007=Estudio Rillo,
+CLI045=Estudio Sauton, CLI050=Kubo Arch, CLI010=Florencia Funes, CLI036=IDEA,
+CLI006=MC Construcciones, CLI013=Rameh, CLI034=OMH Arquitectos, CLI021=LGI,
+CLI033=Nestor Lisi, CLI008=Pi Constructora, CLI031=Alejandro Fontana, CLI042=Stark,
+CLI040=Montaldo, CLI023=Damke, CLI029=Arre, CLI030=Zerep, CLI026=Grupo SIEI,
+CLI003=DBM, CLI025=Arq. Indus, CLI032=Crespo, CLI041=Volk, CLI044=Ines Gonzalez,
+CLI067=Mik Arquitectas, CLI900=Otros
+
+NORMALIZACIÓN DE CLIENTES:
+- Si el usuario escribe "sbmt", "SBMT", "sbmt arq" → CLI004 - SBMT Arquitectura
+- Si escribe "leone", "leone loray", "Leone" → CLI019 - Leone Loray
+- Si escribe "BK", "bk kreative", "BK buildings" → CLI005 - BK Kreative Buildings
+- Si escribe "edifizzi", "edifizi" → CLI001 - Edifizzi
+- Si escribe "analia", "analia valle" → CLI002 - Analia Valle
+- Si escribe "rillo", "estudio rillo" → CLI007 - Estudio Rillo
+- Si escribe "frali", "grupo frali" → CLI027 - Grupo Frali
+- Si escribe "pi", "pi constructora" → CLI008 - Pi Constructora
+- Si escribe "rameh" → CLI013 - Rameh
+- Si escribe "mc", "mc construcciones" → CLI006 - MC Construcciones
+- Siempre corregí el nombre al formato exacto de la lista aunque el usuario lo escriba mal
 
 PROVEEDORES FRECUENTES (usar código PRV###):
 Federico Alonso=PRV001, Gastón Argarañaz=PRV002, Daniel Tapia=PRV003,
@@ -227,7 +243,7 @@ Mensaje del usuario: "{message}"
 Extraé los datos y respondé con este JSON:
 {{
   "tipo": "Ingreso" o "Egreso",
-  "fecha": "DD/MM/YYYY",
+  "fecha": "MM/DD/YYYY",
   "cuenta_origen": "XXXX-Nombre completo",
   "cuenta_destino": "XXXX-Nombre completo",
   "moneda": "Pesos" o "Dolares" o "Euros",
@@ -273,7 +289,7 @@ def build_row(parsed: dict, dolar_blue: float = 1390.0) -> list:
     Factura | Cliente | Proveedor | Expediente | Proyecto |
     Dolar | EUR/USD | Importe USD | ID Fecha | Year | Quarter | Month | YYYY-MM
     """
-    tx_date = datetime.strptime(parsed["fecha"], "%d/%m/%Y")
+    tx_date = datetime.strptime(parsed["fecha"], "%m/%d/%Y")
     moneda  = parsed.get("moneda", "Pesos")
     importe = float(parsed.get("importe", 0))
 
@@ -364,13 +380,133 @@ def get_month_summary() -> dict:
 # CLAUDE IA
 # ─────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────
+# SISTEMA DE APRENDIZAJE
+# Guarda correcciones del usuario en una hoja "Bot_Memoria"
+# y las usa como contexto en cada llamada a Claude
+# ─────────────────────────────────────────────────────────
+
+def get_or_create_memoria_sheet():
+    """Obtiene o crea la hoja Bot_Memoria para guardar aprendizajes."""
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets",
+                  "https://www.googleapis.com/auth/drive"]
+        creds_json = os.getenv("GOOGLE_CREDS_JSON")
+        if creds_json:
+            creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes)
+        else:
+            creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            return sh.worksheet("Bot_Memoria")
+        except:
+            ws = sh.add_worksheet(title="Bot_Memoria", rows=500, cols=4)
+            ws.append_row(["Fecha", "Tipo", "Original", "Corregido"])
+            return ws
+    except Exception as e:
+        log.error(f"Error accediendo a Bot_Memoria: {e}")
+        return None
+
+def guardar_aprendizaje(tipo: str, original: str, corregido: str):
+    """Guarda una corrección en Bot_Memoria."""
+    try:
+        ws = get_or_create_memoria_sheet()
+        if ws:
+            ws.append_row([datetime.now().strftime("%m/%d/%Y"), tipo, original, corregido])
+    except Exception as e:
+        log.error(f"Error guardando aprendizaje: {e}")
+
+def get_memoria() -> str:
+    """Lee la hoja Bot_Memoria y devuelve el contexto de aprendizajes."""
+    try:
+        ws   = get_or_create_memoria_sheet()
+        if not ws:
+            return ""
+        data = ws.get_all_values()
+        if len(data) < 2:
+            return ""
+        memorias = data[1:]  # Skip header
+        if not memorias:
+            return ""
+        lines = "\n".join([f"  [{r[1]}] '{r[2]}' → '{r[3]}'" for r in memorias if len(r) >= 4])
+        return f"""
+
+MEMORIA DE APRENDIZAJE (correcciones anteriores del usuario — tené en cuenta estas preferencias):
+{lines}
+"""
+    except Exception as e:
+        log.error(f"Error leyendo memoria: {e}")
+        return ""
+
+def get_presupuestos_pendientes() -> list:
+    """Lee 004 Presupuestos y devuelve proyectos para dar contexto a Claude."""
+    try:
+        ws   = get_worksheet("004 Presupuestos")
+        data = ws.get_all_values()
+        if len(data) < 2:
+            return []
+        headers = data[0]
+        try:
+            col_exp    = headers.index("Expediente")
+            col_cli    = headers.index("Cliente")
+            col_proy   = headers.index("Proyecto")
+            col_srv    = headers.index("Servicio")
+            col_estado = headers.index("Estado cobro")
+            col_saldo  = headers.index("Saldo")
+            col_monto  = headers.index("Monto")
+        except ValueError:
+            return []
+        resultado = []
+        for row in data[1:]:
+            exp = row[col_exp].strip() if col_exp < len(row) else ""
+            if not exp:
+                continue
+            resultado.append({
+                "expediente": exp,
+                "cliente":    row[col_cli].strip()    if col_cli    < len(row) else "",
+                "proyecto":   row[col_proy].strip()   if col_proy   < len(row) else "",
+                "servicio":   row[col_srv].strip()    if col_srv    < len(row) else "",
+                "estado":     row[col_estado].strip() if col_estado < len(row) else "",
+                "monto":      row[col_monto].strip()  if col_monto  < len(row) else "",
+                "saldo":      row[col_saldo].strip()  if col_saldo  < len(row) else "",
+            })
+        return resultado[:100]
+    except Exception as e:
+        log.error(f"Error leyendo presupuestos: {e}")
+        return []
+
+
 def parse_with_claude(message: str) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    today  = datetime.now().strftime("%d/%m/%Y")
-    resp   = client.messages.create(
+    today  = datetime.now().strftime("%m/%d/%Y")
+
+    # Cargar presupuestos + memoria de aprendizaje
+    presupuestos = get_presupuestos_pendientes()
+    memoria = get_memoria()
+    presup_context = ""
+    if presupuestos:
+        lines = "\n".join([
+            f"  {p['expediente']} | {p['cliente']} | {p['proyecto']} | {p['servicio']} | Estado cobro: {p['estado']} | Monto: {p['monto']} | Saldo: {p['saldo']}"
+            for p in presupuestos
+        ])
+        presup_context = f"""
+
+PRESUPUESTOS EXISTENTES (hoja 004 Presupuestos) — usalos para autocompletar expediente, proyecto y cliente:
+{lines}
+
+INSTRUCCIONES DE BÚSQUEDA:
+- Si el usuario menciona un cliente (ej: "SBMT", "Leone"), buscá ese cliente en la lista y completá el expediente y proyecto automáticamente.
+- Si hay varios expedientes del mismo cliente, elegí el que tenga saldo pendiente o el más reciente.
+- Si el usuario ya menciona el expediente, usalo directamente.
+- Si no encontrás coincidencia, dejá expediente vacío y confianza < 80.
+"""
+
+    resp = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
+        system=SYSTEM_PROMPT + presup_context + memoria,
         messages=[{
             "role": "user",
             "content": USER_PROMPT.format(today=today, message=message)
@@ -508,6 +644,50 @@ async def cmd_resumen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+
+async def cmd_aprender(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Permite al usuario enseñarle al bot una corrección manual."""
+    args = ctx.args
+    if not args or len(args) < 3:
+        await update.message.reply_text(
+            "📚 *Cómo enseñarle al bot*\n\n"
+            "Formato: `/aprender [tipo] [original] → [correcto]`\n\n"
+            "*Ejemplos:*\n"
+            "`/aprender cliente sbmt SBMT Arquitectura`\n"
+            "`/aprender categoria honorarios Venta de servicio`\n"
+            "`/aprender cuenta galicia C.A. Galicia AR$`\n\n"
+            "El bot recordará esta corrección en todas las operaciones futuras.",
+            parse_mode="Markdown"
+        )
+        return
+    tipo     = args[0]
+    original = args[1]
+    correcto = " ".join(args[2:])
+    guardar_aprendizaje(tipo, original, correcto)
+    await update.message.reply_text(
+        f"✅ *¡Aprendido!*\n\n"
+        f"Tipo: `{tipo}`\n"
+        f"Cuando digas `{original}` → lo voy a interpretar como `{correcto}`\n\n"
+        f"_Guardado en Bot_Memoria_",
+        parse_mode="Markdown"
+    )
+
+async def cmd_memoria(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Muestra todo lo que el bot ha aprendido."""
+    try:
+        ws   = get_or_create_memoria_sheet()
+        data = ws.get_all_values() if ws else []
+        if len(data) < 2:
+            await update.message.reply_text("📭 El bot aún no tiene aprendizajes guardados.\nUsá `/aprender` para enseñarle.")
+            return
+        lines = "\n".join([f"• [{r[1]}] `{r[2]}` → `{r[3]}`" for r in data[1:] if len(r) >= 4])
+        await update.message.reply_text(
+            f"📚 *Memoria del bot ({len(data)-1} aprendizajes)*\n\n{lines}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handler principal: interpreta con Claude y pide confirmación."""
     user_id = update.effective_user.id
@@ -518,6 +698,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text or text.startswith("/"):
         return
+
+    # Si hay una corrección pendiente, guardala como aprendizaje
+    if ctx.user_data.get("awaiting_correction"):
+        prev = ctx.user_data.pop("awaiting_correction")
+        guardar_aprendizaje("corrección", prev["original"], text)
+        log.info(f"Aprendizaje guardado: '{prev['original']}' → '{text}'")
 
     msg = await update.message.reply_text("🤖 Analizando con Claude IA...")
 
@@ -612,10 +798,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("pending", None)
 
     elif action == "edit":
+        ctx.user_data["awaiting_correction"] = {"original": original, "parsed": parsed}
         await query.edit_message_text(
             f"✏️ *Corrección*\n\n"
             f"_Original:_ `{original}`\n\n"
-            "Mandame el mensaje corregido con los datos exactos:",
+            "Mandame el mensaje corregido. El bot va a aprender de esta corrección automáticamente.",
             parse_mode="Markdown"
         )
         ctx.user_data.pop("pending", None)
@@ -639,6 +826,8 @@ def main():
     app.add_handler(CommandHandler("ayuda",   cmd_ayuda))
     app.add_handler(CommandHandler("cuentas", cmd_cuentas))
     app.add_handler(CommandHandler("resumen", cmd_resumen))
+    app.add_handler(CommandHandler("aprender", cmd_aprender))
+    app.add_handler(CommandHandler("memoria",  cmd_memoria))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

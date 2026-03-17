@@ -18,7 +18,6 @@ ARCHIVO .env requerido:
 
 import os, json, logging
 from datetime import datetime, date
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -28,7 +27,12 @@ import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
 
-load_dotenv()
+# Soporte local: cargar .env si existe (en Railway las variables vienen del entorno)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")

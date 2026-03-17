@@ -246,9 +246,16 @@ def get_worksheet(sheet_name="003 Transacciones"):
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
-    creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
-    gc    = gspread.authorize(creds)
-    sh    = gc.open_by_key(GOOGLE_SHEET_ID)
+    # Soporte para Railway: leer credenciales desde variable de entorno
+    creds_json = os.getenv("GOOGLE_CREDS_JSON")
+    if creds_json:
+        import tempfile
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
     return sh.worksheet(sheet_name)
 
 def excel_date(dt: date) -> int:

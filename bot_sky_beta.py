@@ -134,69 +134,94 @@ def similarity(a: str, b: str) -> float:
     """Ratio de similitud entre dos strings, case-insensitive."""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def fuzzy_find_cliente(query: str, clientes: list[dict], threshold: float = 0.45) -> dict | None:
+def token_score(query_tokens: list[str], target: str) -> float:
     """
-    Busca el cliente más parecido al query en la lista de clientes.
-    clientes: [{"id": "CLI001", "nombre": "Edifizzi", "representante": "...", "ref": "..."}]
-    Devuelve el mejor match o None si no supera el threshold.
+    Calcula el mejor score entre los tokens del query y el target.
+    Estrategia multi-nivel:
+    1. Si algún token del query es substring del target → 0.95
+    2. Si algún token del target es substring de algún token del query → 0.90
+    3. Mejor score de similitud token-a-token → valor numérico
     """
-    best_score = 0
+    t_lower = target.lower()
+    t_tokens = t_lower.split()
+    best = 0.0
+
+    for q_tok in query_tokens:
+        if len(q_tok) < 3:          # ignorar tokens muy cortos (preposiciones, etc.)
+            continue
+        # substring directo: "canevari" en "lucas canevari"
+        if q_tok in t_lower:
+            return 0.95
+        # token del target dentro del query token
+        for t_tok in t_tokens:
+            if len(t_tok) >= 3 and t_tok in q_tok:
+                best = max(best, 0.90)
+        # similitud fuzzy token a token
+        for t_tok in t_tokens:
+            best = max(best, similarity(q_tok, t_tok))
+
+    return best
+
+def fuzzy_find_cliente(query: str, clientes: list[dict], threshold: float = 0.72) -> dict | None:
+    """
+    Busca el cliente más parecido al query usando matching por tokens.
+    Funciona bien con queries parciales como "canevari" → "Lucas Canevari".
+    """
+    # Normalizar y tokenizar el query (ignorar palabras vacías comunes)
+    STOPWORDS = {"de", "del", "la", "el", "los", "las", "y", "e", "o", "un", "una",
+                 "ingreso", "egreso", "pago", "cobro", "proyecto", "obra", "civil",
+                 "cc", "ca", "galicia", "transferencia", "efectivo", "anticipo", "saldo"}
+    q_tokens = [t for t in query.lower().split() if t not in STOPWORDS and len(t) >= 3]
+
+    if not q_tokens:
+        return None
+
+    best_score = 0.0
     best = None
-    q = query.lower().strip()
+
     for c in clientes:
-        # Comparar contra nombre, representante y id
         targets = [
             c.get("nombre", ""),
             c.get("representante", ""),
-            c.get("id", ""),
         ]
         for t in targets:
             if not t:
                 continue
-            # Exact substring match tiene prioridad
-            if q in t.lower() or t.lower() in q:
-                score = 0.95
-            else:
-                score = similarity(q, t)
+            score = token_score(q_tokens, t)
             if score > best_score:
                 best_score = score
                 best = c
+
     return best if best_score >= threshold else None
 
-def fuzzy_find_proyecto(cliente_nombre: str, proyecto_query: str, presupuestos: list[dict], threshold: float = 0.35) -> dict | None:
+def fuzzy_find_proyecto(cliente_nombre: str, proyecto_tokens: list[str], presupuestos: list[dict], threshold: float = 0.72) -> dict | None:
     """
-    Busca el presupuesto más parecido filtrando primero por cliente,
+    Busca el presupuesto más parecido filtrando primero por cliente (token matching),
     luego por similitud con el nombre del proyecto.
-    Prioriza: saldo pendiente > match más alto > más reciente (expediente mayor).
+    Prioriza: saldo pendiente > match más alto > expediente más reciente.
+    proyecto_tokens: lista de tokens ya limpiados del mensaje del usuario.
     """
-    # Filtrar por cliente
-    cli_q = cliente_nombre.lower().strip()
+    # Filtrar candidatos por cliente usando token matching
+    cli_tokens = [t for t in cliente_nombre.lower().split() if len(t) >= 3]
     candidatos = []
     for p in presupuestos:
-        cli = p.get("cliente", "").lower()
-        if cli_q in cli or cli in cli_q or similarity(cli_q, cli) >= 0.5:
+        cli_score = token_score(cli_tokens, p.get("cliente", ""))
+        if cli_score >= 0.72:
             candidatos.append(p)
 
     if not candidatos:
-        # Si no hay candidatos por cliente, buscar solo por proyecto
-        candidatos = presupuestos
+        candidatos = presupuestos  # fallback: buscar en todos
 
-    # Ahora filtrar por proyecto
-    proy_q = proyecto_query.lower().strip()
+    # Scorer por proyecto
     scored = []
     for p in candidatos:
-        proy = p.get("proyecto", "").lower()
-        if proy_q in proy or proy in proy_q:
-            score = 0.95
-        else:
-            score = similarity(proy_q, proy)
-        if score >= threshold:
-            scored.append((score, p))
+        proy_score = token_score(proyecto_tokens, p.get("proyecto", ""))
+        if proy_score >= threshold:
+            scored.append((proy_score, p))
 
     if not scored:
         return None
 
-    # Ordenar: primero los con saldo > 0, luego por score desc
     def sort_key(item):
         score, p = item
         try:
@@ -327,40 +352,75 @@ def get_presupuestos_from_sheet() -> list[dict]:
         log.error(f"Error leyendo presupuestos: {e}")
         return _presupuestos_cache
 
-def find_expediente(cliente_query: str, proyecto_query: str) -> dict | None:
+STOPWORDS_BOT = {
+    "de", "del", "la", "el", "los", "las", "y", "e", "o", "un", "una",
+    "ingreso", "egreso", "pago", "cobro", "proyecto", "obra", "civil",
+    "cc", "ca", "galicia", "transferencia", "efectivo", "anticipo", "saldo",
+    "pesos", "dolares", "usd", "factura", "sin", "con", "por", "para",
+    "cobre", "pague", "gaste", "me", "le", "al"
+}
+
+def message_to_tokens(message: str) -> list:
+    import re
+    words = re.split(r"[\s.,;:!?/\-]+", message.lower())
+    return [w for w in words if len(w) >= 3 and w not in STOPWORDS_BOT]
+
+def find_expediente(mensaje_completo: str) -> dict | None:
     """
-    Punto de entrada para buscar expediente.
-    1. Fuzzy match de cliente en 001 Clientes
-    2. Fuzzy match de proyecto en 004 Presupuestos filtrando por ese cliente
-    Devuelve el presupuesto encontrado o None.
+    Recibe el mensaje completo y encuentra el mejor expediente.
+    1. Tokeniza el mensaje
+    2. Prueba cada token como posible cliente
+    3. Con el cliente encontrado, busca el proyecto con los demás tokens
+    4. Fallback: presupuesto con mayor saldo de ese cliente
     """
-    clientes = get_clientes_from_sheet()
+    clientes     = get_clientes_from_sheet()
     presupuestos = get_presupuestos_from_sheet()
 
-    # Paso 1: encontrar cliente
-    cliente_match = fuzzy_find_cliente(cliente_query, clientes)
-    cliente_nombre = cliente_match["nombre"] if cliente_match else cliente_query
+    tokens = message_to_tokens(mensaje_completo)
+    if not tokens:
+        return None
 
-    # Paso 2: encontrar proyecto
-    if proyecto_query:
-        presup = fuzzy_find_proyecto(cliente_nombre, proyecto_query, presupuestos)
-    else:
-        # Sin proyecto: tomar el más reciente con saldo del cliente
-        cli_q = cliente_nombre.lower()
+    # Paso 1: mejor cliente probando ventanas de 1, 2 y 3 tokens
+    best_cli_score = 0.0
+    best_cli = None
+
+    for i in range(len(tokens)):
+        for window in [tokens[i:i+1], tokens[i:i+2], tokens[i:i+3]]:
+            if not window:
+                continue
+            query = " ".join(window)
+            match = fuzzy_find_cliente(query, clientes, threshold=0.72)
+            if match:
+                score = token_score(window, match["nombre"])
+                if score > best_cli_score:
+                    best_cli_score = score
+                    best_cli = match
+
+    cliente_nombre = best_cli["nombre"] if best_cli else ""
+
+    # Paso 2: buscar proyecto con todos los tokens del mensaje
+    proy_tokens = [t for t in tokens if len(t) >= 3]
+    presup = None
+    if proy_tokens:
+        presup = fuzzy_find_proyecto(cliente_nombre or mensaje_completo, proy_tokens, presupuestos)
+
+    # Paso 3: fallback al mas reciente con saldo del cliente
+    if not presup and best_cli:
+        cli_tokens = [t for t in best_cli["nombre"].lower().split() if len(t) >= 3]
         candidatos = [
             p for p in presupuestos
-            if cli_q in p["cliente"].lower() or similarity(cli_q, p["cliente"].lower()) >= 0.5
+            if token_score(cli_tokens, p.get("cliente", "")) >= 0.72
         ]
-        # Ordenar por saldo desc, luego expediente desc (más reciente)
         def saldo_num(p):
             try:
-                return float(str(p.get("saldo","0")).replace(",",".").replace("$","").strip() or 0)
+                return float(str(p.get("saldo", "0")).replace(",", ".").replace("$", "").strip() or 0)
             except:
                 return 0
         candidatos.sort(key=lambda p: (saldo_num(p), p["expediente"]), reverse=True)
         presup = candidatos[0] if candidatos else None
 
     return presup
+
 
 # ─────────────────────────────────────────────────────────
 # CONSTRUCCIÓN DE FILA — columnas actualizadas v2
@@ -623,25 +683,9 @@ def parse_with_claude(message: str) -> dict:
     clientes_txt = clientes_as_text(clientes)
     memoria      = get_memoria()
 
-    # ── Intentar resolver expediente antes de llamar a Claude ──
-    # Extraer términos del mensaje para fuzzy search
+    # ── Resolver expediente antes de llamar a Claude ──
     expediente_context = ""
-    presupuesto_match  = None
-
-    # Heurística: buscar cliente y proyecto en el mensaje
-    # Pasamos el mensaje completo a find_expediente con términos separados
-    palabras = message.lower().split()
-    # Intentar con cada palabra como posible cliente o proyecto
-    # Primero con el mensaje completo dividido en mitades
-    mid = len(palabras) // 2
-    for cliente_q in [" ".join(palabras[:mid+1]), " ".join(palabras), " ".join(palabras[:3])]:
-        for proyecto_q in [" ".join(palabras[mid:]), " ".join(palabras[-3:]), " ".join(palabras)]:
-            match = find_expediente(cliente_q, proyecto_q)
-            if match:
-                presupuesto_match = match
-                break
-        if presupuesto_match:
-            break
+    presupuesto_match  = find_expediente(message)
 
     if presupuesto_match:
         expediente_context = f"""

@@ -644,10 +644,10 @@ ESTRUCTURA DE LA HOJA (19 columnas, en este orden):
 5. Moneda — "Pesos", "Dolares" o "Euros"
 6. Importe — positivo para ingresos, NEGATIVO para egresos
 7. Factura — "S/Factura", "Factura C" o "Factura A"
-8. Proveedor — PRV### (solo egresos)
-9. Cliente — CLI### (solo ingresos)
-10. Expediente — código F#####
-11. Proyecto/Descripción — fórmula en ingresos, texto libre en egresos
+8. Proveedor — nombre del proveedor (solo egresos)
+9. Cliente — nombre del cliente exactamente como lo mencionó el usuario (solo ingresos)
+10. Expediente — dejar vacío siempre
+11. Proyecto/Descripción — nombre del proyecto exactamente como lo mencionó el usuario
 12-19. Calculados automáticamente
 
 CUENTAS ORIGEN:
@@ -679,12 +679,11 @@ REGLAS DE INFERENCIA:
 - Vivienda sin aclarar → 2100-DE Vivienda Unifamiliar
 - Obra civil / industrial → 2300-DE Obras Civiles
 - Importe NEGATIVO para egresos
-- Si cliente no está en la lista → CLI900 - Otros
-- Si proveedor no está en la lista → PRV900 - Otros
 
-IMPORTANTE — EXPEDIENTE:
-El expediente y proyecto los resuelve el bot antes de llamarte, usando fuzzy matching contra la planilla de presupuestos.
-Si ya viene expediente en el contexto, usalo. Si no viene, dejá expediente vacío y confianza < 80.
+IMPORTANTE — CLIENTE Y PROYECTO:
+Usá exactamente el nombre que mencionó el usuario. No busques códigos ni hagas matching.
+Si dice "Cliente: Aranda" → cliente = "Aranda". Si dice "Proyecto: San Sebastián L261" → proyecto = "San Sebastián L261".
+Si no menciona cliente, dejá vacío. Si no menciona proyecto, dejá vacío.
 
 IMPORTANTE — FACTURAS:
 - "sin factura" / "s/factura" → "S/Factura"
@@ -702,11 +701,6 @@ USER_PROMPT = """Fecha de hoy: {today}
 
 Mensaje del usuario: "{message}"
 
-{expediente_context}
-
-Lista de clientes activos:
-{clientes_list}
-
 Extraé los datos y respondé con este JSON:
 {{
   "tipo": "Ingreso" o "Egreso",
@@ -716,10 +710,10 @@ Extraé los datos y respondé con este JSON:
   "moneda": "Pesos" o "Dolares" o "Euros",
   "importe": número (positivo si ingreso, NEGATIVO si egreso),
   "factura": "S/Factura", "Factura C" o "Factura A",
-  "cliente": "CLIXX - Nombre" o "",
-  "proveedor": "PRVXX - Nombre" o "",
-  "expediente": "F#####" o "",
-  "proyecto": "descripción" o "",
+  "cliente": "nombre exacto del cliente o ''",
+  "proveedor": "nombre exacto del proveedor o ''",
+  "expediente": "",
+  "proyecto": "nombre exacto del proyecto o ''",
   "confianza": 0-100,
   "dudas": "qué no quedó claro" o null
 }}"""
@@ -728,36 +722,10 @@ Extraé los datos y respondé con este JSON:
 # PARSE CON CLAUDE
 # ─────────────────────────────────────────────────────────
 
-def parse_with_claude(message: str, forced_expediente_context: str | None = None) -> dict:
+def parse_with_claude(message: str) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today  = datetime.now().strftime("%m/%d/%Y")
-
-    # Cargar clientes y memoria
-    clientes     = get_clientes_from_sheet()
-    clientes_txt = clientes_as_text(clientes)
-    memoria      = get_memoria()
-
-    # ── Resolver expediente antes de llamar a Claude ──
-    if forced_expediente_context is not None:
-        expediente_context = forced_expediente_context
-    else:
-        expediente_context = ""
-        presupuesto_match  = find_expediente(message)
-
-        if presupuesto_match:
-            expediente_context = f"""
-EXPEDIENTE ENCONTRADO (fuzzy match en planilla de presupuestos):
-- Expediente: {presupuesto_match['expediente']}
-- Cliente: {presupuesto_match['cliente']}
-- Proyecto: {presupuesto_match['proyecto']}
-- Servicio: {presupuesto_match['servicio']}
-- Estado cobro: {presupuesto_match['estado']}
-- Saldo: {presupuesto_match['saldo']}
-
-Usá este expediente ({presupuesto_match['expediente']}) y cliente ({presupuesto_match['cliente']}) en el JSON.
-Si el mensaje menciona algo diferente que no coincide, preferí el match de la planilla."""
-        else:
-            expediente_context = "No se encontró expediente automáticamente. Dejá expediente vacío si no está claro."
+    memoria = get_memoria()
 
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -768,8 +736,6 @@ Si el mensaje menciona algo diferente que no coincide, preferí el match de la p
             "content": USER_PROMPT.format(
                 today=today,
                 message=message,
-                expediente_context=expediente_context,
-                clientes_list=clientes_txt,
             )
         }]
     )
@@ -1118,37 +1084,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg  = await update.message.reply_text("🤔 Analizando...")
 
     try:
-        # ── Verificar confianza en el cliente antes de llamar a Claude ──
-        CONFIDENT_THRESHOLD = 0.87
-        MINIMUM_SCORE       = 0.25
-
-        best_score, top_clients = find_best_client_from_message(text)
-
-        if MINIMUM_SCORE <= best_score < CONFIDENT_THRESHOLD and top_clients:
-            # Zona incierta → mostrar selector de cliente
-            ctx.user_data["pending_message"]   = text
-            ctx.user_data["client_candidates"] = top_clients
-
-            buttons = []
-            row = []
-            for i, c in enumerate(top_clients):
-                row.append(InlineKeyboardButton(c["nombre"], callback_data=f"client_select:{i}"))
-                if len(row) == 2:
-                    buttons.append(row)
-                    row = []
-            if row:
-                buttons.append(row)
-            buttons.append([InlineKeyboardButton("⏩ Sin cliente específico", callback_data="client_select:none")])
-
-            await msg.edit_text(
-                f"🔍 No encontré el cliente con certeza.\n"
-                f"¿A cuál de estos corresponde?",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-            return
-
-        # Confianza alta (o sin cliente) → proceder directo
         parsed = parse_with_claude(text)
         conf_text = format_confirmation(parsed)
 
@@ -1285,82 +1220,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Operación cancelada.")
         ctx.user_data.pop("pending", None)
 
-    elif action.startswith("client_select:"):
-        idx         = action.split(":", 1)[1]
-        pending_msg = ctx.user_data.get("pending_message")
-        candidates  = ctx.user_data.get("client_candidates", [])
-
-        if not pending_msg:
-            await query.edit_message_text("❌ No hay operación pendiente.")
-            return
-
-        loading = await query.edit_message_text("🤔 Procesando...")
-
-        if idx == "none":
-            forced_context = None  # procesar sin forzar cliente
-        else:
-            try:
-                selected = candidates[int(idx)]
-            except (IndexError, ValueError):
-                await loading.edit_text("❌ Selección inválida.")
-                return
-
-            # Buscar mejor presupuesto del cliente seleccionado
-            presupuestos  = get_presupuestos_from_sheet()
-            cli_tokens    = [t for t in selected["nombre"].lower().split() if len(t) >= 3]
-            candidatos_p  = [
-                p for p in presupuestos
-                if token_score(cli_tokens, p.get("cliente", "")) >= 0.60
-            ]
-
-            if candidatos_p:
-                def saldo_n(p):
-                    try:
-                        return float(str(p.get("saldo", "0")).replace(",", ".").replace("$", "").strip() or 0)
-                    except:
-                        return 0
-                candidatos_p.sort(key=saldo_n, reverse=True)
-                best_p = candidatos_p[0]
-                forced_context = f"""
-CLIENTE SELECCIONADO MANUALMENTE POR EL USUARIO:
-- Expediente: {best_p['expediente']}
-- Cliente: {best_p['cliente']}
-- Proyecto: {best_p['proyecto']}
-- Servicio: {best_p['servicio']}
-- Estado cobro: {best_p['estado']}
-- Saldo: {best_p['saldo']}
-
-Usá este expediente ({best_p['expediente']}) y cliente ({best_p['cliente']}) en el JSON.
-El usuario seleccionó explícitamente este cliente."""
-            else:
-                forced_context = f"""
-CLIENTE SELECCIONADO MANUALMENTE POR EL USUARIO:
-- Cliente: {selected['id']} - {selected['nombre']}
-No se encontró expediente específico. Usá este cliente en el JSON."""
-
-            guardar_aprendizaje("cliente", pending_msg[:60], selected["nombre"])
-
-        try:
-            parsed    = parse_with_claude(pending_msg, forced_expediente_context=forced_context)
-            conf_text = format_confirmation(parsed)
-
-            ctx.user_data["pending"]          = parsed
-            ctx.user_data["original_message"] = pending_msg
-            ctx.user_data.pop("pending_message",   None)
-            ctx.user_data.pop("client_candidates", None)
-
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Registrar", callback_data="confirm"),
-                    InlineKeyboardButton("✏️ Corregir",  callback_data="edit"),
-                    InlineKeyboardButton("❌ Cancelar",  callback_data="cancel"),
-                ]
-            ])
-            await loading.edit_text(conf_text, parse_mode="Markdown", reply_markup=keyboard)
-
-        except Exception as e:
-            log.error(f"Error procesando con cliente forzado: {e}")
-            await loading.edit_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
 # ─────────────────────────────────────────────────────────
 # MAIN

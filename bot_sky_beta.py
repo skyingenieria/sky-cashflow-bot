@@ -194,6 +194,55 @@ def fuzzy_find_cliente(query: str, clientes: list[dict], threshold: float = 0.72
 
     return best if best_score >= threshold else None
 
+
+def fuzzy_find_top_clientes(query: str, clientes: list[dict], n: int = 5) -> list[tuple[float, dict]]:
+    """Retorna los top N clientes con sus scores, sin umbral mínimo."""
+    STOPWORDS = {"de", "del", "la", "el", "los", "las", "y", "e", "o", "un", "una",
+                 "ingreso", "egreso", "pago", "cobro", "proyecto", "obra", "civil",
+                 "cc", "ca", "galicia", "transferencia", "efectivo", "anticipo", "saldo"}
+    q_tokens = [t for t in query.lower().split() if t not in STOPWORDS and len(t) >= 3]
+    if not q_tokens:
+        return []
+    scored = []
+    for c in clientes:
+        targets = [c.get("nombre", ""), c.get("representante", "")]
+        best = max((token_score(q_tokens, t) for t in targets if t), default=0.0)
+        if best > 0:
+            scored.append((best, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:n]
+
+
+def find_best_client_from_message(message: str, n: int = 5) -> tuple[float, list[dict]]:
+    """
+    Escanea todo el mensaje y retorna (mejor_score, top_N_candidatos).
+    Prueba ventanas de 1, 2 y 3 tokens para encontrar el mejor match.
+    """
+    clientes = get_clientes_from_sheet()
+    tokens = message_to_tokens(message)
+    if not tokens:
+        return 0.0, []
+
+    candidate_scores: dict[str, tuple[float, dict]] = {}
+    for i in range(len(tokens)):
+        for window in [tokens[i:i+1], tokens[i:i+2], tokens[i:i+3]]:
+            if not window:
+                continue
+            query = " ".join(window)
+            for score, c in fuzzy_find_top_clientes(query, clientes, n=n):
+                cid = c["id"]
+                if cid not in candidate_scores or score > candidate_scores[cid][0]:
+                    candidate_scores[cid] = (score, c)
+
+    if not candidate_scores:
+        return 0.0, []
+
+    sorted_cands = sorted(candidate_scores.values(), key=lambda x: x[0], reverse=True)
+    best_score = sorted_cands[0][0]
+    top_clients = [c for _, c in sorted_cands[:n]]
+    return best_score, top_clients
+
+
 def fuzzy_find_proyecto(cliente_nombre: str, proyecto_tokens: list[str], presupuestos: list[dict], threshold: float = 0.72) -> dict | None:
     """
     Busca el presupuesto más parecido filtrando primero por cliente (token matching),
@@ -357,7 +406,8 @@ STOPWORDS_BOT = {
     "ingreso", "egreso", "pago", "cobro", "proyecto", "obra", "civil",
     "cc", "ca", "galicia", "transferencia", "efectivo", "anticipo", "saldo",
     "pesos", "dolares", "usd", "factura", "sin", "con", "por", "para",
-    "cobre", "pague", "gaste", "me", "le", "al"
+    "cobre", "pague", "gaste", "me", "le", "al",
+    "cliente", "proveedor", "monto", "importe", "fecha", "tipo",
 }
 
 def message_to_tokens(message: str) -> list:
@@ -492,7 +542,7 @@ async def append_to_sheet(parsed: dict) -> int:
     cuenta_origen  = parsed.get("cuenta_origen", "")
     factura        = parsed.get("factura", "")
     es_cc_galicia  = "1600" in cuenta_origen
-    es_factura_a   = factura in ("C/Factura", "Facturado", "Factura A")
+    es_factura_a   = factura == "Factura A"
 
     if parsed.get("tipo") == "Ingreso" and es_cc_galicia and es_factura_a:
         importe_bruto = float(parsed.get("importe", 0))
@@ -593,7 +643,7 @@ ESTRUCTURA DE LA HOJA (19 columnas, en este orden):
 4. Cuenta Destino — hacia dónde va
 5. Moneda — "Pesos", "Dolares" o "Euros"
 6. Importe — positivo para ingresos, NEGATIVO para egresos
-7. Factura — "S/Factura" o "C/Factura"
+7. Factura — "S/Factura", "Factura C" o "Factura A"
 8. Proveedor — PRV### (solo egresos)
 9. Cliente — CLI### (solo ingresos)
 10. Expediente — código F#####
@@ -625,7 +675,7 @@ REGLAS DE INFERENCIA:
 - Sin moneda + monto grande → Pesos
 - Efectivo → Mostrador AR$ (pesos) o Mostrador U$D (dólares)
 - Transferencia / banco sin aclarar → C.A. Galicia AR$
-- "cc galicia" → 1600-C.C. Galicia AR$
+- "cc galicia" → 1600-C.C. Galicia AR$ | "ca galicia" → 1400-C.A. Galicia AR$
 - Vivienda sin aclarar → 2100-DE Vivienda Unifamiliar
 - Obra civil / industrial → 2300-DE Obras Civiles
 - Importe NEGATIVO para egresos
@@ -636,11 +686,15 @@ IMPORTANTE — EXPEDIENTE:
 El expediente y proyecto los resuelve el bot antes de llamarte, usando fuzzy matching contra la planilla de presupuestos.
 Si ya viene expediente en el contexto, usalo. Si no viene, dejá expediente vacío y confianza < 80.
 
-IMPORTANTE — IVA EN CC GALICIA:
-Si es un ingreso por 1600-C.C. Galicia AR$ con factura (C/Factura o Facturado), el bot automáticamente
+IMPORTANTE — FACTURAS:
+- "sin factura" / "s/factura" → "S/Factura"
+- "factura c" / "con factura" / "c/factura" → "Factura C" (sin split de IVA)
+- "factura a" → "Factura A" (CON split de IVA automático)
+
+IMPORTANTE — IVA EN CC GALICIA (SOLO FACTURA A):
+Si es un ingreso por 1600-C.C. Galicia AR$ con "Factura A", el bot automáticamente
 va a generar dos filas: una por honorarios netos y otra por el IVA (2950-IVA Facturado).
-Vos solo interpretá el mensaje como un ingreso normal con el importe bruto total que menciona el usuario.
-No necesitás calcular el split vos.
+Factura C NO genera split de IVA. Vos solo registrá el importe bruto total.
 
 Respondé ÚNICAMENTE con JSON válido, sin texto ni markdown."""
 
@@ -661,7 +715,7 @@ Extraé los datos y respondé con este JSON:
   "cuenta_destino": "XXXX-Nombre completo",
   "moneda": "Pesos" o "Dolares" o "Euros",
   "importe": número (positivo si ingreso, NEGATIVO si egreso),
-  "factura": "S/Factura" o "C/Factura",
+  "factura": "S/Factura", "Factura C" o "Factura A",
   "cliente": "CLIXX - Nombre" o "",
   "proveedor": "PRVXX - Nombre" o "",
   "expediente": "F#####" o "",
@@ -674,7 +728,7 @@ Extraé los datos y respondé con este JSON:
 # PARSE CON CLAUDE
 # ─────────────────────────────────────────────────────────
 
-def parse_with_claude(message: str) -> dict:
+def parse_with_claude(message: str, forced_expediente_context: str | None = None) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today  = datetime.now().strftime("%m/%d/%Y")
 
@@ -684,11 +738,14 @@ def parse_with_claude(message: str) -> dict:
     memoria      = get_memoria()
 
     # ── Resolver expediente antes de llamar a Claude ──
-    expediente_context = ""
-    presupuesto_match  = find_expediente(message)
+    if forced_expediente_context is not None:
+        expediente_context = forced_expediente_context
+    else:
+        expediente_context = ""
+        presupuesto_match  = find_expediente(message)
 
-    if presupuesto_match:
-        expediente_context = f"""
+        if presupuesto_match:
+            expediente_context = f"""
 EXPEDIENTE ENCONTRADO (fuzzy match en planilla de presupuestos):
 - Expediente: {presupuesto_match['expediente']}
 - Cliente: {presupuesto_match['cliente']}
@@ -699,8 +756,8 @@ EXPEDIENTE ENCONTRADO (fuzzy match en planilla de presupuestos):
 
 Usá este expediente ({presupuesto_match['expediente']}) y cliente ({presupuesto_match['cliente']}) en el JSON.
 Si el mensaje menciona algo diferente que no coincide, preferí el match de la planilla."""
-    else:
-        expediente_context = "No se encontró expediente automáticamente. Dejá expediente vacío si no está claro."
+        else:
+            expediente_context = "No se encontró expediente automáticamente. Dejá expediente vacío si no está claro."
 
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -737,7 +794,7 @@ def format_confirmation(parsed: dict, es_split_iva: bool = False) -> str:
     split_iva = (
         es_in and
         "1600" in cuenta_origen and
-        factura in ("C/Factura", "Facturado", "Factura A")
+        factura == "Factura A"
     )
 
     lines = [
@@ -1061,6 +1118,37 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg  = await update.message.reply_text("🤔 Analizando...")
 
     try:
+        # ── Verificar confianza en el cliente antes de llamar a Claude ──
+        CONFIDENT_THRESHOLD = 0.87
+        MINIMUM_SCORE       = 0.25
+
+        best_score, top_clients = find_best_client_from_message(text)
+
+        if MINIMUM_SCORE <= best_score < CONFIDENT_THRESHOLD and top_clients:
+            # Zona incierta → mostrar selector de cliente
+            ctx.user_data["pending_message"]   = text
+            ctx.user_data["client_candidates"] = top_clients
+
+            buttons = []
+            row = []
+            for i, c in enumerate(top_clients):
+                row.append(InlineKeyboardButton(c["nombre"], callback_data=f"client_select:{i}"))
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
+            buttons.append([InlineKeyboardButton("⏩ Sin cliente específico", callback_data="client_select:none")])
+
+            await msg.edit_text(
+                f"🔍 No encontré el cliente con certeza.\n"
+                f"¿A cuál de estos corresponde?",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return
+
+        # Confianza alta (o sin cliente) → proceder directo
         parsed = parse_with_claude(text)
         conf_text = format_confirmation(parsed)
 
@@ -1156,7 +1244,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             split_iva = (
                 parsed.get("tipo") == "Ingreso" and
                 "1600" in cuenta_origen and
-                factura in ("C/Factura", "Facturado", "Factura A")
+                factura == "Factura A"
             )
 
             if split_iva:
@@ -1196,6 +1284,83 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == "cancel":
         await query.edit_message_text("❌ Operación cancelada.")
         ctx.user_data.pop("pending", None)
+
+    elif action.startswith("client_select:"):
+        idx         = action.split(":", 1)[1]
+        pending_msg = ctx.user_data.get("pending_message")
+        candidates  = ctx.user_data.get("client_candidates", [])
+
+        if not pending_msg:
+            await query.edit_message_text("❌ No hay operación pendiente.")
+            return
+
+        loading = await query.edit_message_text("🤔 Procesando...")
+
+        if idx == "none":
+            forced_context = None  # procesar sin forzar cliente
+        else:
+            try:
+                selected = candidates[int(idx)]
+            except (IndexError, ValueError):
+                await loading.edit_text("❌ Selección inválida.")
+                return
+
+            # Buscar mejor presupuesto del cliente seleccionado
+            presupuestos  = get_presupuestos_from_sheet()
+            cli_tokens    = [t for t in selected["nombre"].lower().split() if len(t) >= 3]
+            candidatos_p  = [
+                p for p in presupuestos
+                if token_score(cli_tokens, p.get("cliente", "")) >= 0.60
+            ]
+
+            if candidatos_p:
+                def saldo_n(p):
+                    try:
+                        return float(str(p.get("saldo", "0")).replace(",", ".").replace("$", "").strip() or 0)
+                    except:
+                        return 0
+                candidatos_p.sort(key=saldo_n, reverse=True)
+                best_p = candidatos_p[0]
+                forced_context = f"""
+CLIENTE SELECCIONADO MANUALMENTE POR EL USUARIO:
+- Expediente: {best_p['expediente']}
+- Cliente: {best_p['cliente']}
+- Proyecto: {best_p['proyecto']}
+- Servicio: {best_p['servicio']}
+- Estado cobro: {best_p['estado']}
+- Saldo: {best_p['saldo']}
+
+Usá este expediente ({best_p['expediente']}) y cliente ({best_p['cliente']}) en el JSON.
+El usuario seleccionó explícitamente este cliente."""
+            else:
+                forced_context = f"""
+CLIENTE SELECCIONADO MANUALMENTE POR EL USUARIO:
+- Cliente: {selected['id']} - {selected['nombre']}
+No se encontró expediente específico. Usá este cliente en el JSON."""
+
+            guardar_aprendizaje("cliente", pending_msg[:60], selected["nombre"])
+
+        try:
+            parsed    = parse_with_claude(pending_msg, forced_expediente_context=forced_context)
+            conf_text = format_confirmation(parsed)
+
+            ctx.user_data["pending"]          = parsed
+            ctx.user_data["original_message"] = pending_msg
+            ctx.user_data.pop("pending_message",   None)
+            ctx.user_data.pop("client_candidates", None)
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Registrar", callback_data="confirm"),
+                    InlineKeyboardButton("✏️ Corregir",  callback_data="edit"),
+                    InlineKeyboardButton("❌ Cancelar",  callback_data="cancel"),
+                ]
+            ])
+            await loading.edit_text(conf_text, parse_mode="Markdown", reply_markup=keyboard)
+
+        except Exception as e:
+            log.error(f"Error procesando con cliente forzado: {e}")
+            await loading.edit_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
 # ─────────────────────────────────────────────────────────
 # MAIN

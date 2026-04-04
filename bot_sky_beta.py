@@ -461,15 +461,53 @@ def find_expediente(mensaje_completo: str) -> dict | None:
             p for p in presupuestos
             if token_score(cli_tokens, p.get("cliente", "")) >= 0.72
         ]
-        def saldo_num(p):
-            try:
-                return float(str(p.get("saldo", "0")).replace(",", ".").replace("$", "").strip() or 0)
-            except:
-                return 0
         candidatos.sort(key=lambda p: (saldo_num(p), p["expediente"]), reverse=True)
         presup = candidatos[0] if candidatos else None
 
     return presup
+
+
+# ─────────────────────────────────────────────────────────
+# HELPERS DE SALDO Y BÚSQUEDA DE CANDIDATOS
+# ─────────────────────────────────────────────────────────
+
+def saldo_num(p: dict) -> float:
+    try:
+        v = str(p.get("saldo", "0")).replace("$", "").replace(".", "").replace(",", ".").strip()
+        return float(v or 0)
+    except:
+        return 0
+
+def find_top_expedientes(hint: str, presupuestos: list[dict], n: int = 4) -> list[dict]:
+    """
+    Devuelve los top N presupuestos que mejor matchean el hint.
+    Prioriza: mejor score de match + saldo pendiente > 0.
+    Si no hay match mínimo, devuelve los más recientes con saldo.
+    """
+    tokens = message_to_tokens(hint)
+
+    if not tokens:
+        with_saldo = [p for p in presupuestos if saldo_num(p) > 0]
+        return sorted(with_saldo, key=lambda p: p["expediente"], reverse=True)[:n]
+
+    scored: dict[str, tuple[float, dict]] = {}
+    for p in presupuestos:
+        cli_score  = token_score(tokens, p.get("cliente", ""))
+        proy_score = token_score(tokens, p.get("proyecto", ""))
+        best = max(cli_score, proy_score)
+        if best >= 0.30:
+            boost = 0.08 if saldo_num(p) > 0 else 0
+            exp = p["expediente"]
+            total = best + boost
+            if exp not in scored or total > scored[exp][0]:
+                scored[exp] = (total, p)
+
+    if scored:
+        return [p for _, p in sorted(scored.values(), key=lambda x: x[0], reverse=True)[:n]]
+
+    # Fallback: recientes con saldo
+    with_saldo = [p for p in presupuestos if saldo_num(p) > 0]
+    return sorted(with_saldo, key=lambda p: p["expediente"], reverse=True)[:n]
 
 
 # ─────────────────────────────────────────────────────────
@@ -804,6 +842,41 @@ def format_confirmation(parsed: dict, es_split_iva: bool = False) -> str:
     lines += ["", "¿Lo registro así en la planilla?"]
     return "\n".join(lines)
 
+
+async def show_expediente_selection(msg, parsed: dict, hint: str):
+    """
+    Muestra los top 4 expedientes como botones para que el usuario elija.
+    Se usa en ingresos, donde el expediente es el campo más crítico.
+    """
+    presupuestos = get_presupuestos_from_sheet()
+    candidates   = find_top_expedientes(hint, presupuestos, n=4)
+
+    imp = abs(float(parsed.get("importe", 0)))
+    sym = {"Pesos": "$", "Dolares": "U$D", "Euros": "€"}.get(parsed.get("moneda", "Pesos"), "$")
+    cuenta_label = parsed.get("cuenta_origen", "").split("-", 1)[-1].strip()
+    factura      = parsed.get("factura", "S/Factura")
+
+    header = (
+        f"💰 *Ingreso · {cuenta_label} · {sym} {imp:,.0f}*"
+        f"{'  · ' + factura if factura != 'S/Factura' else ''}\n\n"
+        f"¿A qué proyecto corresponde?"
+    )
+
+    buttons = []
+    for p in candidates:
+        saldo = saldo_num(p)
+        saldo_txt = f" · Saldo ${saldo:,.0f}" if saldo > 0 else " · Saldo $0"
+        cli   = p.get("cliente", "")[:18]
+        proy  = p.get("proyecto", "")[:22]
+        label = f"{p['expediente']} — {cli} — {proy}{saldo_txt}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"exp_{p['expediente']}")])
+
+    buttons.append([InlineKeyboardButton("🔍 Buscar otro proyecto", callback_data="exp_buscar")])
+
+    await msg.edit_text(header, parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(buttons))
+
+
 def get_month_summary() -> dict:
     ws   = get_worksheet()
     data = ws.get_all_values()
@@ -1081,23 +1154,44 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
-    msg  = await update.message.reply_text("🤔 Analizando...")
+
+    # ── Modo búsqueda de expediente (usuario tocó "Buscar otro") ──
+    if ctx.user_data.get("waiting_for") == "exp_search":
+        ctx.user_data.pop("waiting_for", None)
+        parsed = ctx.user_data.get("pending")
+        if parsed:
+            msg = await update.message.reply_text("🔍 Buscando...")
+            presupuestos = get_presupuestos_from_sheet()
+            candidates   = find_top_expedientes(text, presupuestos, n=4)
+            if candidates:
+                await show_expediente_selection(msg, parsed, text)
+            else:
+                await msg.edit_text(
+                    f"📭 Sin resultados para `{text}`.\n\nMandá otro término o cancelá con /cancelar.",
+                    parse_mode="Markdown"
+                )
+        return
+
+    msg = await update.message.reply_text("🤔 Analizando...")
 
     try:
         parsed = parse_with_claude(text)
-        conf_text = format_confirmation(parsed)
-
         ctx.user_data["pending"] = parsed
         ctx.user_data["original_message"] = text
 
-        keyboard = InlineKeyboardMarkup([
-            [
+        if parsed.get("tipo") == "Ingreso":
+            # Paso 1: elegir expediente
+            hint = (parsed.get("cliente", "") + " " + parsed.get("proyecto", "") + " " + text).strip()
+            await show_expediente_selection(msg, parsed, hint)
+        else:
+            # Egreso: confirmación directa
+            conf_text = format_confirmation(parsed)
+            keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Registrar", callback_data="confirm"),
                 InlineKeyboardButton("✏️ Corregir", callback_data="edit"),
                 InlineKeyboardButton("❌ Cancelar", callback_data="cancel"),
-            ]
-        ])
-        await msg.edit_text(conf_text, parse_mode="Markdown", reply_markup=keyboard)
+            ]])
+            await msg.edit_text(conf_text, parse_mode="Markdown", reply_markup=keyboard)
 
     except Exception as e:
         log.error(f"Error procesando mensaje: {e}")
@@ -1208,10 +1302,49 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.error(f"Error registrando: {e}")
             await loading.edit_text(f"❌ Error al registrar:\n`{e}`", parse_mode="Markdown")
 
+    elif action.startswith("exp_"):
+        # ── Selección de expediente ──
+        exp_code = action[4:]  # e.g. "F26015"
+
+        if exp_code == "buscar":
+            await query.edit_message_text(
+                "🔍 Mandame el nombre del cliente o proyecto para buscar.",
+                parse_mode="Markdown"
+            )
+            ctx.user_data["waiting_for"] = "exp_search"
+            return
+
+        if not parsed:
+            await query.edit_message_text("❌ Sesión expirada. Mandá el mensaje de nuevo.")
+            return
+
+        # Buscar el presupuesto seleccionado y completar datos
+        presupuestos = get_presupuestos_from_sheet()
+        presup = next((p for p in presupuestos if p["expediente"] == exp_code), None)
+
+        parsed["expediente"] = exp_code
+        if presup:
+            parsed["cliente"]  = presup.get("cliente", parsed.get("cliente", ""))
+            parsed["proyecto"] = presup.get("proyecto", parsed.get("proyecto", ""))
+            # Mapear servicio del presupuesto a cuenta_destino si aplica
+            srv = presup.get("servicio", "")
+            if srv and not parsed.get("cuenta_destino"):
+                parsed["cuenta_destino"] = srv
+
+        ctx.user_data["pending"] = parsed
+
+        # Mostrar confirmación final
+        conf_text = format_confirmation(parsed)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Registrar", callback_data="confirm"),
+            InlineKeyboardButton("✏️ Corregir",  callback_data="edit"),
+            InlineKeyboardButton("❌ Cancelar",  callback_data="cancel"),
+        ]])
+        await query.edit_message_text(conf_text, parse_mode="Markdown", reply_markup=keyboard)
+
     elif action == "edit":
         await query.edit_message_text(
-            "✏️ Mandame el mensaje corregido y lo proceso de nuevo.\n\n"
-            "_Tip: si el expediente no quedó bien, podés usar `/buscar [cliente]` para encontrarlo._",
+            "✏️ Mandame el mensaje corregido y lo proceso de nuevo.",
             parse_mode="Markdown"
         )
         ctx.user_data.pop("pending", None)

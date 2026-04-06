@@ -719,9 +719,26 @@ REGLAS DE INFERENCIA:
 - Importe NEGATIVO para egresos
 
 IMPORTANTE — CLIENTE Y PROYECTO:
-Usá exactamente el nombre que mencionó el usuario. No busques códigos ni hagas matching.
+Usá exactamente el nombre que mencionó el usuario. No busques códigos ni hagas matching para clientes.
 Si dice "Cliente: Aranda" → cliente = "Aranda". Si dice "Proyecto: San Sebastián L261" → proyecto = "San Sebastián L261".
 Si no menciona cliente, dejá vacío. Si no menciona proyecto, dejá vacío.
+
+IMPORTANTE — PROVEEDOR (solo egresos):
+Usá la lista oficial de proveedores para completar el campo proveedor. Si el usuario menciona un nombre que coincide con alguno de la lista, usá el valor completo tal como aparece acá:
+PRV001 - Federico Alonso → salarios, sueldo propio, Federico, Fede
+PRV002 - PRV002 - Gastón Argarañaz → Gastón, Argarañaz
+PRV003 - PRV003 - Daniel Tapia → Daniel, Tapia
+PRV004 - PRV004 - Andrea Palumbo → Andrea, Palumbo
+PRV005 - PRV005 - Agencia de Marketing → agencia, marketing
+PRV006 - PRV006 - Contador → contador, contadora, contabilidad
+PRV007 - PRV007 - ARCA / ARBA → ARCA, ARBA, impuestos, fisco
+PRV008 - PRV008 - Banco Galicia → banco, comisión bancaria, Galicia
+PRV009 - PRV009 - Meta Ads → Meta, Facebook Ads, Instagram Ads, pauta
+PRV900 - PRV900 - Otros → cualquier otro sin match claro
+PRV901 - PRV901 - Ignacio Blois → Ignacio, Blois
+PRV902 - PRV902 - Ignacio Mignone → Mignone
+PRV903 - PRV903 - Freelancer X → freelancer
+Si no podés determinar el proveedor, usá "PRV900 - Otros".
 
 IMPORTANTE — FACTURAS:
 - "sin factura" / "s/factura" → "S/Factura"
@@ -1289,10 +1306,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             else:
+                es_egreso = parsed.get("tipo") == "Egreso"
+                if es_egreso:
+                    tercero_line = f"🏭 Proveedor:  `{parsed.get('proveedor','—')}`"
+                else:
+                    tercero_line = f"👤 Cliente:    `{parsed.get('cliente','—')}`"
+                extra = ""
+                if not es_egreso and parsed.get("expediente"):
+                    extra = f"\n📁 Expediente: `{parsed.get('expediente','—')}`"
                 await loading.edit_text(
                     f"✅ *Registrado en fila {fila}*\n\n"
-                    f"📁 Expediente: `{parsed.get('expediente','—')}`\n"
-                    f"👤 Cliente:    `{parsed.get('cliente','—')}`\n"
+                    f"{tercero_line}"
+                    f"{extra}\n"
                     f"💵 Importe:    `{abs(float(parsed.get('importe',0))):,.0f}`",
                     parse_mode="Markdown"
                 )
